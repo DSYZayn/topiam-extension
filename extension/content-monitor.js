@@ -24,7 +24,7 @@
   let isDetectedTopIamPlatform = false;
   let topiamDetectInFlight = false;
   let topiamDetectAttempts = 0;
-  let userDebugPanelEnabled = true;
+  let userDebugPanelEnabled = false;
   let topiamLogoutReportedAt = 0;
   let topiamLogoutClickPendingAt = 0;
   let topiamAuthProbeInFlight = false;
@@ -355,7 +355,7 @@
   function loadDebugPanelPreference() {
     chrome.storage.local.get([DEBUG_PANEL_STORAGE_KEY], (result) => {
       const value = result?.[DEBUG_PANEL_STORAGE_KEY];
-      userDebugPanelEnabled = value !== false;
+      userDebugPanelEnabled = value === true;
       if (isDetectedTopIamPlatform) {
         applyDebugPanelPreference('storage_load');
       }
@@ -369,9 +369,53 @@
     chrome.storage.onChanged.addListener((changes, areaName) => {
       if (areaName !== 'local') return;
       if (!Object.prototype.hasOwnProperty.call(changes, DEBUG_PANEL_STORAGE_KEY)) return;
-      userDebugPanelEnabled = changes[DEBUG_PANEL_STORAGE_KEY]?.newValue !== false;
+      userDebugPanelEnabled = changes[DEBUG_PANEL_STORAGE_KEY]?.newValue === true;
       applyDebugPanelPreference('storage_change');
     });
+  }
+
+  function maskAccountLike(value) {
+    const text = String(value || '');
+    if (!text) return text;
+    if (text.length <= 2) return '*'.repeat(text.length);
+    if (text.length <= 6) {
+      return `${text.charAt(0)}${'*'.repeat(text.length - 1)}`;
+    }
+    return `${text.slice(0, 2)}${'*'.repeat(text.length - 4)}${text.slice(-2)}`;
+  }
+
+  function maskSensitiveValue(key, value) {
+    const lowerKey = String(key || '').toLowerCase();
+    if (/pass|pwd|passwd|password|secret|credential/.test(lowerKey)) {
+      return '******';
+    }
+    if (/username|user|login|account|email/.test(lowerKey)) {
+      return maskAccountLike(value);
+    }
+    return value;
+  }
+
+  function sanitizeDebugPayload(payload, depth = 0) {
+    if (depth > 5) return '[depth_limited]';
+    if (payload == null) return payload;
+
+    if (Array.isArray(payload)) {
+      return payload.map((item) => sanitizeDebugPayload(item, depth + 1));
+    }
+
+    if (typeof payload !== 'object') {
+      return payload;
+    }
+
+    const out = {};
+    Object.entries(payload).forEach(([key, value]) => {
+      if (value && typeof value === 'object') {
+        out[key] = sanitizeDebugPayload(value, depth + 1);
+        return;
+      }
+      out[key] = maskSensitiveValue(key, value);
+    });
+    return out;
   }
 
   function onTopIamPortalPathReady(source = 'unknown') {
@@ -566,7 +610,8 @@
     let text = `[${time}] ${message}`;
     if (payload) {
       try {
-        text += ` | ${JSON.stringify(payload)}`;
+        const safePayload = sanitizeDebugPayload(payload);
+        text += ` | ${JSON.stringify(safePayload)}`;
       } catch (e) {
         text += ' | [payload]';
       }

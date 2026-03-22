@@ -17,7 +17,7 @@ document.addEventListener('DOMContentLoaded', () => {
       statusDiv.className = 'status inactive';
     }
 
-    debugPanelEnabledInput.checked = result.debugPanelEnabled !== false;
+    debugPanelEnabledInput.checked = result.debugPanelEnabled === true;
     
     if (result.discoveredApps && result.discoveredApps.length > 0) {
       renderApps(result.discoveredApps);
@@ -60,7 +60,7 @@ document.addEventListener('DOMContentLoaded', () => {
     chrome.storage.local.remove(keys, () => {
       chrome.runtime.sendMessage({ action: 'clearPluginCache' }, () => {
         domainsInput.value = '';
-        debugPanelEnabledInput.checked = true;
+        debugPanelEnabledInput.checked = false;
         statusDiv.textContent = '状态: 缓存已清除，请重新配置';
         statusDiv.className = 'status inactive';
         appListDiv.innerHTML = '<div style="color: #999; font-size: 12px;">暂无，点击TopIAM应用后自动识别</div>';

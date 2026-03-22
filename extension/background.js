@@ -880,10 +880,55 @@ async function clearCookiesForOrigin(originUrl) {
 
 function sendMonitorDebug(tabId, message, payload) {
   if (typeof tabId !== 'number') return;
+
+  const maskAccountLike = (value) => {
+    const text = String(value || '');
+    if (!text) return text;
+    if (text.length <= 2) return '*'.repeat(text.length);
+    if (text.length <= 6) {
+      return `${text.charAt(0)}${'*'.repeat(text.length - 1)}`;
+    }
+    return `${text.slice(0, 2)}${'*'.repeat(text.length - 4)}${text.slice(-2)}`;
+  };
+
+  const maskSensitiveValue = (key, value) => {
+    const lowerKey = String(key || '').toLowerCase();
+    if (/pass|pwd|passwd|password|secret|credential/.test(lowerKey)) {
+      return '******';
+    }
+    if (/username|user|login|account|email/.test(lowerKey)) {
+      return maskAccountLike(value);
+    }
+    return value;
+  };
+
+  const sanitizeDebugPayload = (input, depth = 0) => {
+    if (depth > 5) return '[depth_limited]';
+    if (input == null) return input;
+
+    if (Array.isArray(input)) {
+      return input.map((item) => sanitizeDebugPayload(item, depth + 1));
+    }
+
+    if (typeof input !== 'object') {
+      return input;
+    }
+
+    const out = {};
+    Object.entries(input).forEach(([key, value]) => {
+      if (value && typeof value === 'object') {
+        out[key] = sanitizeDebugPayload(value, depth + 1);
+        return;
+      }
+      out[key] = maskSensitiveValue(key, value);
+    });
+    return out;
+  };
+
   chrome.tabs.sendMessage(tabId, {
     action: 'topiamDebug',
     message,
-    payload: payload || {}
+    payload: sanitizeDebugPayload(payload || {})
   }, () => {});
 }
 
