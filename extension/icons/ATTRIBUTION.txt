@@ -1,0 +1,8 @@
+Logo source:
+- Original artwork generated locally for this extension.
+
+License:
+- Owned by this project repository (no third-party asset dependency).
+
+Notes:
+- Generated from script and exported to 16/32/48/128 PNG sizes for Chrome extension usage.
