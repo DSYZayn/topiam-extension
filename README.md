@@ -7,7 +7,7 @@
 			<img src="https://img.shields.io/badge/Platform-Chromium%20Extensions-2ea44f" alt="Platform" />
 		</a>
 	</p>
-	<img src="view.png" alt="插件页面预览" width="920" />
+	<img src="view.png" alt="插件页面预览" width="300" />
 </div>
 
 ## 项目简介
