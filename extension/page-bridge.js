@@ -8,9 +8,14 @@
   const EVENT_NAME = (currentScript && currentScript.dataset && currentScript.dataset.topiamEvent) || '__TOPIAM_APP_LIST_RESPONSE__';
   const FORM_EVENT_NAME = (currentScript && currentScript.dataset && currentScript.dataset.topiamFormEvent) || '__TOPIAM_FORM_POST_CAPTURED__';
   const FORM_DECISION_EVENT = (currentScript && currentScript.dataset && currentScript.dataset.topiamDecisionEvent) || '__TOPIAM_FORM_POST_DECISION__';
+  const BLOCK_CREDENTIAL_EVENT = (currentScript && currentScript.dataset && currentScript.dataset.topiamBlockCredentialEvent) || '__TOPIAM_BLOCK_CREDENTIAL_STORE__';
   const DEBUG_EVENT_NAME = (currentScript && currentScript.dataset && currentScript.dataset.topiamDebugEvent) || '__TOPIAM_DEBUG_EVENT__';
   const API_PATTERN = /\/api\/v1\/user\/app\/list/i;
+  const FORM_DECISION_TIMEOUT_MS = 1200;
+  const DEFAULT_BLOCK_DURATION_MS = 2 * 60 * 1000;
+  const MAX_BLOCK_DURATION_MS = 10 * 60 * 1000;
   const pendingNativeSubmit = new Map();
+  let credentialStoreBlockedUntil = 0;
 
   function debug(message, payload) {
     try {
@@ -24,6 +29,56 @@
     try {
       window.dispatchEvent(new CustomEvent(EVENT_NAME, { detail: payload }));
     } catch (e) {}
+  }
+
+  function normalizeBlockDuration(rawDuration) {
+    const parsed = Number(rawDuration);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return DEFAULT_BLOCK_DURATION_MS;
+    }
+    return Math.max(1000, Math.min(MAX_BLOCK_DURATION_MS, Math.floor(parsed)));
+  }
+
+  function isCredentialStoreBlocked() {
+    return Date.now() < credentialStoreBlockedUntil;
+  }
+
+  function installCredentialStoreBlocker() {
+    try {
+      const credentialsApi = navigator && navigator.credentials;
+      if (!credentialsApi || typeof credentialsApi.store !== 'function') {
+        debug('当前页面不支持 navigator.credentials.store，无需安装拦截');
+        return;
+      }
+
+      const rawStore = credentialsApi.store.bind(credentialsApi);
+      credentialsApi.store = function(...args) {
+        if (isCredentialStoreBlocked()) {
+          debug('已拦截 navigator.credentials.store 调用', {
+            remainingMs: Math.max(0, credentialStoreBlockedUntil - Date.now())
+          });
+          return Promise.resolve(null);
+        }
+        return rawStore(...args);
+      };
+
+      debug('已安装 navigator.credentials.store 拦截器');
+    } catch (error) {
+      debug('安装 navigator.credentials.store 拦截器失败', {
+        error: error?.message || String(error)
+      });
+    }
+
+    window.addEventListener(BLOCK_CREDENTIAL_EVENT, (event) => {
+      const detail = event?.detail || {};
+      const durationMs = normalizeBlockDuration(detail.durationMs);
+      credentialStoreBlockedUntil = Math.max(credentialStoreBlockedUntil, Date.now() + durationMs);
+      debug('已更新凭据存储拦截窗口', {
+        source: detail.source || 'unknown',
+        durationMs,
+        blockedUntil: credentialStoreBlockedUntil
+      });
+    });
   }
 
   function handleBody(url, body) {
@@ -118,7 +173,7 @@
       try {
         rawSubmit.call(form);
       } catch (e) {}
-    }, 5000);
+    }, FORM_DECISION_TIMEOUT_MS);
 
     pendingNativeSubmit.set(token, { form, rawSubmit, timer });
     window.dispatchEvent(new CustomEvent(FORM_EVENT_NAME, {
@@ -144,6 +199,8 @@
       });
     };
   }
+
+  installCredentialStoreBlocker();
 
   const rawOpen = XMLHttpRequest.prototype.open;
   const rawSend = XMLHttpRequest.prototype.send;

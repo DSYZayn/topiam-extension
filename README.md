@@ -1,8 +1,14 @@
-# TopIAM Universal Form Interceptor
-
-> 一款面向 TopIAM 场景的浏览器扩展：自动接管表单代填跳转、跨系统登录链路与会话状态。
-
-[![Platform](https://img.shields.io/badge/Platform-Chromium%20Extensions-2ea44f)](#安装与使用)
+<div align="center">
+	<img src="extension/icons/icon128.png" alt="TopIAM Extension Logo" width="96" />
+	<h1>TopIAM Universal Form Interceptor</h1>
+	<p>一款面向 TopIAM 场景的浏览器扩展：自动接管表单代填跳转、跨系统登录链路与会话状态。</p>
+	<p>
+		<a href="#安装与使用">
+			<img src="https://img.shields.io/badge/Platform-Chromium%20Extensions-2ea44f" alt="Platform" />
+		</a>
+	</p>
+	<img src="view.png" alt="插件页面预览" width="920" />
+</div>
 
 ## 项目简介
 

@@ -2,7 +2,7 @@ const CREDENTIAL_TTL_MS = 30 * 60 * 1000; // 30分钟，避免长流程中凭据
 const LAUNCH_GRANT_TTL_MS = 30 * 60 * 1000; // 也同步增加到30分钟
 const BG_LOG_PREFIX = '[TopIAM BG]';
 const TAB_TASK_TTL_MS = 10 * 60 * 1000;
-const PREFETCH_TIMEOUT_MS = 12000;
+const PREFETCH_TIMEOUT_MS = 9000;
 // 凭据现在支持在TTL内无限次读取，无需readCount限制
 const CRED_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
 const CRED_CACHE_KEY = 'topiamEncryptedCredentialCache';
@@ -16,6 +16,10 @@ let TOPIAM_IDENTITY = {
   source: ''
 };
 
+// 记录上次成功同步时的 topiam-employee-cookie 值
+// 用于检测会话过期（当该值变化时，表示登录已过期）
+let TOPIAM_EMPLOYEE_COOKIE_FINGERPRINT = '';
+
 let TOPIAM_AUTH_STATE = {
   authenticated: false,
   updatedAt: 0,
@@ -27,17 +31,7 @@ let TOPIAM_AUTH_SOFT_FAIL = {
   lastAt: 0
 };
 const TOPIAM_AUTH_SOFT_FAIL_ESCALATE_COUNT = 4;
-const TOPIAM_HEARTBEAT_INTERVAL_MS = 15000;
-const TOPIAM_HEARTBEAT_FAIL_THRESHOLD = 2;
 
-let TOPIAM_HEARTBEAT_FAIL = {
-  count: 0,
-  lastAt: 0,
-  reason: ''
-};
-let TOPIAM_HEARTBEAT_LAST_CHECK_AT = 0;
-
-const TOPIAM_SESSION_COOKIE_NAME = /session|token|auth|sid|jsessionid|remember|ticket/i;
 const TOPIAM_LOGOUT_PATH_RE = /\/api\/v1\/logout(?:$|\?)/i;
 const TOPIAM_LOGOUT_SIGNAL_COOLDOWN_MS = 4000;
 let TOPIAM_LAST_LOGOUT_SIGNAL_AT = 0;
@@ -58,7 +52,7 @@ function bgLog(message, payload) {
   console.log(`${BG_LOG_PREFIX} ${message}`, payload);
 }
 
-function setTopIamIdentity(username, source = 'unknown', fullName = '') {
+async function setTopIamIdentity(username, source = 'unknown', fullName = '') {
   const safeName = String(username || '').trim();
   if (!safeName) return;
   const safeFullName = String(fullName || '').trim();
@@ -80,11 +74,100 @@ function setTopIamIdentity(username, source = 'unknown', fullName = '') {
     source: TOPIAM_IDENTITY.source
   };
 
+  // 记录当前的 topiam-employee-cookie 值（用于后续会话过期检测）
+  try {
+    const employeeCookie = await readTopIamEmployeeCookie();
+
+    if (employeeCookie.found && employeeCookie.value) {
+      TOPIAM_EMPLOYEE_COOKIE_FINGERPRINT = String(employeeCookie.value || '').trim();
+      bgLog('已记录会话 Cookie 指纹（用于过期检测）', {
+        fingerprintLength: TOPIAM_EMPLOYEE_COOKIE_FINGERPRINT.length,
+        domain: employeeCookie.domain
+      });
+    } else {
+      bgLog('未找到 topiam-employee-cookie，可能是首次访问');
+    }
+  } catch (error) {
+    bgLog('记录会话 Cookie 指纹失败', { error: error?.message });
+  }
+
   bgLog('已更新TopIAM平台用户身份', {
     username: safeName,
     fullName: safeFullName,
-    source: TOPIAM_IDENTITY.source
+    source: TOPIAM_IDENTITY.source,
+    cookieFingerprintSet: Boolean(TOPIAM_EMPLOYEE_COOKIE_FINGERPRINT)
   });
+}
+
+async function readTopIamEmployeeCookie() {
+  const domains = [...new Set((TOPIAM_DOMAINS || []).map(normalizeTopIamDomain).filter(Boolean))];
+  if (!domains.length) {
+    return {
+      found: false,
+      value: '',
+      domain: ''
+    };
+  }
+
+  for (const domain of domains) {
+    const protocolCandidates = ['https', 'http'];
+    for (const protocol of protocolCandidates) {
+      const url = `${protocol}://${String(domain || '').trim().toLowerCase().replace(/^\./, '')}/`;
+      const employeeCookie = await new Promise((resolve) => {
+        chrome.cookies.get({
+          name: 'topiam-employee-cookie',
+          url
+        }, (cookie) => {
+          resolve(cookie || null);
+        });
+      });
+
+      if (employeeCookie && employeeCookie.value) {
+        return {
+          found: true,
+          value: String(employeeCookie.value || '').trim(),
+          domain: String(employeeCookie.domain || '')
+        };
+      }
+    }
+  }
+
+  return {
+    found: false,
+    value: '',
+    domain: ''
+  };
+}
+
+async function checkTopIamCookieStability() {
+  const fingerprint = String(TOPIAM_EMPLOYEE_COOKIE_FINGERPRINT || '').trim();
+  if (!fingerprint) {
+    return {
+      stable: false,
+      reason: 'fingerprint_missing',
+      fingerprintSet: false,
+      hasCurrentCookie: false
+    };
+  }
+
+  const current = await readTopIamEmployeeCookie();
+  if (!current.found || !current.value) {
+    return {
+      stable: false,
+      reason: 'cookie_missing',
+      fingerprintSet: true,
+      hasCurrentCookie: false
+    };
+  }
+
+  const unchanged = current.value === fingerprint;
+  return {
+    stable: unchanged,
+    reason: unchanged ? 'unchanged' : 'changed',
+    fingerprintSet: true,
+    hasCurrentCookie: true,
+    domain: current.domain
+  };
 }
 
 function getTopIamIdentity() {
@@ -100,7 +183,6 @@ function setTopIamAuthState(authenticated, source = 'unknown') {
 
   if (TOPIAM_AUTH_STATE.authenticated) {
     TOPIAM_AUTH_SOFT_FAIL = { count: 0, lastAt: 0 };
-    TOPIAM_HEARTBEAT_FAIL = { count: 0, lastAt: 0, reason: '' };
   }
 
   bgLog('TopIAM认证状态更新', TOPIAM_AUTH_STATE);
@@ -128,58 +210,10 @@ function getCookiesByDomain(domain) {
   });
 }
 
-function hasValidTopIamSessionCookie(cookies) {
-  const nowSec = Date.now() / 1000;
-  return cookies.some((item) => {
-    const name = String(item?.name || '');
-    if (!TOPIAM_SESSION_COOKIE_NAME.test(name)) return false;
-    if (!item?.value) return false;
-    if (typeof item.expirationDate === 'number' && item.expirationDate <= nowSec) return false;
-    return true;
-  });
-}
-
 async function probeTopIamAuthByCookies(source = 'cookie_probe') {
-  const candidateDomains = [...new Set(
-    (TOPIAM_DOMAINS || [])
-      .map((domain) => String(domain || '').trim().toLowerCase())
-      .filter(Boolean)
-  )];
-
-  if (candidateDomains.length === 0) {
-    return isTopIamAuthenticated();
-  }
-
-  const cookieBatches = await Promise.all(candidateDomains.map((domain) => getCookiesByDomain(domain)));
-  const cookies = cookieBatches.flat();
-  const authenticated = hasValidTopIamSessionCookie(cookies);
-  const previous = isTopIamAuthenticated();
-  const hasAnyCookies = cookies.length > 0;
-
-  if (authenticated && authenticated !== previous) {
-    setTopIamAuthState(authenticated, source);
-    return authenticated;
-  }
-
-  // 仅在TopIAM域无任何cookie时，才将认证状态判定为失效，避免会话cookie命名差异导致误杀
-  if (!authenticated && previous && !hasAnyCookies) {
-    setTopIamAuthState(false, `${source}_cookie_empty`);
-    bgLog('cookie探针命中空cookie，仅更新TopIAM认证状态，不执行全局会话销毁', {
-      source,
-      previous,
-      hasAnyCookies
-    });
-    return false;
-  }
-
-  if (!authenticated && previous && hasAnyCookies) {
-    bgLog('cookie探针未命中会话cookie，保持当前认证状态（避免误判）', {
-      source,
-      cookieCount: cookies.length
-    });
-  }
-
-  return authenticated;
+  // 现在会话检测完全基于 topiam-employee-cookie 值变化
+  // 该函数保留用于兼容性，直接返回当前认证状态
+  return isTopIamAuthenticated();
 }
 
 function normalizeTopIamDomain(domainLike) {
@@ -195,14 +229,44 @@ function normalizeTopIamDomain(domainLike) {
   }
 }
 
-function buildTopIamHeartbeatBases() {
-  const domains = [...new Set((TOPIAM_DOMAINS || []).map(normalizeTopIamDomain).filter(Boolean))];
-  const bases = [];
-  for (const domain of domains) {
-    bases.push(`https://${domain}`);
-    bases.push(`http://${domain}`);
+function isTopIamControlPath(pathLike) {
+  const path = String(pathLike || '').toLowerCase();
+  if (!path) return false;
+
+  return /^\/portal\/app(?:\/|$)/.test(path)
+    || /^\/login(?:\/|$)/.test(path)
+    || /^\/signin(?:\/|$)/.test(path)
+    || /^\/oauth(?:\/|$)/.test(path)
+    || /^\/cas(?:\/|$)/.test(path)
+    || /^\/auth\/login(?:\/|$)/.test(path)
+    || /\/api\/v1\/authorize\/form\//.test(path)
+    || /\/api\/v1\/user\/app\/initiator\//.test(path)
+    || /\/authorize\/form\//.test(path)
+    || /\/initiator(?:\/|$)/.test(path);
+}
+
+async function hasOpenTopIamControlTab() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    const domains = [...new Set((TOPIAM_DOMAINS || []).map(normalizeTopIamDomain).filter(Boolean))];
+    if (!domains.length) return false;
+
+    return tabs.some((tab) => {
+      const urlRaw = String(tab?.url || '').trim();
+      if (!urlRaw || !/^https?:\/\//i.test(urlRaw)) return false;
+      try {
+        const parsed = new URL(urlRaw);
+        const host = String(parsed.hostname || '').toLowerCase();
+        const inTopIamDomain = domains.some((domain) => host === domain || host.endsWith(`.${domain}`));
+        if (!inTopIamDomain) return false;
+        return isTopIamControlPath(parsed.pathname || '/');
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return false;
   }
-  return [...new Set(bases)];
 }
 
 function parseTopIamCurrentUserPayload(payload) {
@@ -237,78 +301,6 @@ function parseTopIamCurrentUserPayload(payload) {
     username,
     fullName
   };
-}
-
-async function probeTopIamAuthByCurrentUserApi(source = 'heartbeat') {
-  const bases = buildTopIamHeartbeatBases();
-  if (bases.length === 0) {
-    return { decisive: false, authenticated: isTopIamAuthenticated(), reason: 'no_topiam_domains' };
-  }
-
-  let firstDecisiveFalse = null;
-
-  for (const base of bases) {
-    const endpoint = `${base}/api/v1/session/current_user?_topiam_bg_heartbeat=1&_ts=${Date.now()}`;
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 3500);
-      const resp = await fetch(endpoint, {
-        method: 'GET',
-        credentials: 'include',
-        cache: 'no-store',
-        redirect: 'follow',
-        signal: controller.signal
-      });
-      clearTimeout(timer);
-
-      if (resp.status === 401 || resp.status === 403) {
-        firstDecisiveFalse = firstDecisiveFalse || { decisive: true, authenticated: false, reason: `http_${resp.status}` };
-        continue;
-      }
-
-      if (!resp.ok) {
-        continue;
-      }
-
-      let redirectedToLogin = false;
-      try {
-        const final = new URL(String(resp.url || ''), endpoint);
-        const finalPath = String(final.pathname || '').toLowerCase();
-        redirectedToLogin = resp.redirected && (
-          /^\/login(?:\/|$)/.test(finalPath)
-          || /^\/signin(?:\/|$)/.test(finalPath)
-          || /^\/oauth(?:\/|$)/.test(finalPath)
-          || /^\/cas(?:\/|$)/.test(finalPath)
-          || /^\/auth\/login(?:\/|$)/.test(finalPath)
-        );
-      } catch {}
-
-      if (redirectedToLogin) {
-        firstDecisiveFalse = firstDecisiveFalse || { decisive: true, authenticated: false, reason: 'redirect_login' };
-        continue;
-      }
-
-      const payload = await resp.clone().json().catch(() => null);
-      const parsed = parseTopIamCurrentUserPayload(payload);
-      if (!parsed.decisive) {
-        continue;
-      }
-
-      if (parsed.authenticated) {
-        setTopIamIdentity(parsed.username, `${source}_${parsed.reason}`, parsed.fullName || '');
-        setTopIamAuthState(true, `${source}_${parsed.reason}`);
-        return { decisive: true, authenticated: true, reason: parsed.reason, username: parsed.username };
-      }
-
-      firstDecisiveFalse = firstDecisiveFalse || { decisive: true, authenticated: false, reason: parsed.reason };
-    } catch {}
-  }
-
-  if (firstDecisiveFalse) {
-    return firstDecisiveFalse;
-  }
-
-  return { decisive: false, authenticated: isTopIamAuthenticated(), reason: 'heartbeat_inconclusive' };
 }
 
 // 【诊断】bgLog 函数已定义，进行第一次日志测试
@@ -353,6 +345,40 @@ function getHostnameSafe(urlLike, fallback = '') {
   } catch (error) {
     return fallback;
   }
+}
+
+function isEquivalentPrivateOrigin(originA, originB) {
+  if (!originA || !originB) return false;
+  if (originA === originB) return true;
+
+  try {
+    const left = new URL(originA);
+    const right = new URL(originB);
+    const leftProto = String(left.protocol || '').toLowerCase();
+    const rightProto = String(right.protocol || '').toLowerCase();
+    if (!['http:', 'https:'].includes(leftProto) || !['http:', 'https:'].includes(rightProto)) {
+      return false;
+    }
+    if (String(left.hostname || '').toLowerCase() !== String(right.hostname || '').toLowerCase()) {
+      return false;
+    }
+    return isPrivateIpV4(left.hostname);
+  } catch (error) {
+    return false;
+  }
+}
+
+function isProtectedOrigin(originLike) {
+  const origin = String(originLike || '').trim();
+  if (!origin) return false;
+  if (PROTECTED_APP_ORIGINS.has(origin)) return true;
+
+  for (const candidate of PROTECTED_APP_ORIGINS) {
+    if (isEquivalentPrivateOrigin(candidate, origin)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function attachTaskToHash(url, taskId) {
@@ -493,7 +519,7 @@ const LaunchGate = {
       this.grantsByTab.delete(String(tabId));
       return false;
     }
-    return record.origin === origin;
+    return record.origin === origin || isEquivalentPrivateOrigin(record.origin, origin);
   },
 
   cleanup() {
@@ -526,7 +552,7 @@ const TabTaskIndex = {
       return '';
     }
     // 如果origin匹配则直接返回，否则记录日志但仍然返回（允许跨域回退）
-    if (origin && record.origin && record.origin !== origin) {
+    if (origin && record.origin && record.origin !== origin && !isEquivalentPrivateOrigin(record.origin, origin)) {
       bgLog('任务恢复时origin不匹配，但仍然允许恢复', {
         tabId,
         expectedOrigin: record.origin,
@@ -550,7 +576,7 @@ const TabTaskIndex = {
   }
 };
 
-// SSO 会话管理：跟踪用户登录状态，支持10秒自动过期
+// SSO 会话管理：跟踪用户登录状态，按会话过期时间精确调度
 const LoginSession = {
   sessions: new Map(), // tabId -> { login: boolean, startTime, username, expiresAt }
   SESSION_DURATION_MS: 30 * 60 * 1000, // 30分钟
@@ -567,6 +593,7 @@ const LoginSession = {
       expiresAt: now + safeDurationMs
     });
     bgLog('SSO会话开始', { tabId, username, duration: safeDurationMs });
+    scheduleNextSessionExpiryCheck('session_started');
   },
 
   isSessionValid(tabId) {
@@ -591,39 +618,182 @@ const LoginSession = {
   // 检查是否曾经有过会话（即使已过期也返回，用于判断是否需要强制注销）
   hadSessionEver(tabId) {
     const session = this.sessions.get(String(tabId));
-    return session && session.login === true;
+    return Boolean(session && session.login === true);
   },
 
   endSession(tabId) {
     if (this.sessions.has(String(tabId))) {
       this.sessions.delete(String(tabId));
       bgLog('SSO会话已结束', { tabId });
+      scheduleNextSessionExpiryCheck('session_ended');
     }
   },
 
   cleanup() {
     const now = Date.now();
+    let removedCount = 0;
     for (const [tabId, session] of this.sessions.entries()) {
       if (session.expiresAt <= now) {
         this.sessions.delete(tabId);
+        removedCount += 1;
         bgLog('会话过期清理', { tabId });
       }
+    }
+    if (removedCount > 0) {
+      scheduleNextSessionExpiryCheck('session_cleanup');
     }
   }
 };
 
-async function revokeAllAppSessions(reason = 'topiam_logout') {
-  const entries = Array.from(LoginSession.sessions.entries());
-  if (!entries.length) {
-    bgLog('全局会话销毁：当前无活动会话', { reason });
+let SESSION_EXPIRY_TIMER = null;
+let SESSION_EXPIRY_TARGET_AT = 0;
+
+function sendSessionExpiredToTab(tabId, session, reason = 'session_expired') {
+  try {
+    const numTabId = parseInt(tabId, 10);
+    if (!Number.isFinite(numTabId)) return;
+
+    chrome.tabs.sendMessage(
+      numTabId,
+      { action: 'enforceSessionExpiration', reason },
+      { frameId: 0 },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          bgLog('通知会话过期失败（标签页可能已关闭）', {
+            tabId,
+            reason,
+            error: chrome.runtime.lastError.message
+          });
+          return;
+        }
+        if (response?.success) {
+          bgLog('✓ 会话过期通知已发送并被处理', { tabId, reason });
+        }
+      }
+    );
+  } catch (error) {
+    bgLog('发送会话过期通知异常', { tabId, reason, error: error?.message });
+  }
+}
+
+async function processExpiredSessions(trigger = 'scheduled_timer') {
+  const now = Date.now();
+  const expiredSessions = [];
+
+  for (const [tabId, session] of LoginSession.sessions.entries()) {
+    if (session.expiresAt <= now) {
+      expiredSessions.push({ tabId, session });
+    }
+  }
+
+  if (!expiredSessions.length) {
+    return 0;
+  }
+
+  bgLog('检测到会话过期，开始处理', {
+    trigger,
+    count: expiredSessions.length
+  });
+
+  for (const { tabId, session } of expiredSessions) {
+    sendSessionExpiredToTab(tabId, session, trigger);
+  }
+
+  LoginSession.cleanup();
+  return expiredSessions.length;
+}
+
+function scheduleNextSessionExpiryCheck(reason = 'unknown') {
+  if (SESSION_EXPIRY_TIMER) {
+    clearTimeout(SESSION_EXPIRY_TIMER);
+    SESSION_EXPIRY_TIMER = null;
+  }
+
+  const now = Date.now();
+  let nearestExpiresAt = 0;
+
+  for (const session of LoginSession.sessions.values()) {
+    const expiresAt = Number(session?.expiresAt || 0);
+    if (!expiresAt) continue;
+    if (!nearestExpiresAt || expiresAt < nearestExpiresAt) {
+      nearestExpiresAt = expiresAt;
+    }
+  }
+
+  if (!nearestExpiresAt) {
+    SESSION_EXPIRY_TARGET_AT = 0;
     return;
   }
 
-  bgLog('全局会话销毁开始', { reason, count: entries.length });
+  SESSION_EXPIRY_TARGET_AT = nearestExpiresAt;
+  const delayMs = Math.max(300, nearestExpiresAt - now + 50);
+
+  SESSION_EXPIRY_TIMER = setTimeout(() => {
+    SESSION_EXPIRY_TIMER = null;
+    processExpiredSessions('session_expiry_timer')
+      .catch((error) => {
+        bgLog('会话过期调度执行异常', { error: error?.message || 'unknown' });
+      })
+      .finally(() => {
+        scheduleNextSessionExpiryCheck('session_expiry_timer_followup');
+      });
+  }, delayMs);
+
+  bgLog('已调度下一次会话过期检查', {
+    reason,
+    sessionCount: LoginSession.sessions.size,
+    targetAt: SESSION_EXPIRY_TARGET_AT,
+    nextCheckInMs: delayMs
+  });
+}
+
+async function revokeAllAppSessions(reason = 'topiam_logout') {
+  const entries = Array.from(LoginSession.sessions.entries());
+  const targetTabIds = new Set();
 
   for (const [tabId] of entries) {
     const numTabId = parseInt(tabId, 10);
     if (!Number.isFinite(numTabId)) continue;
+    targetTabIds.add(numTabId);
+  }
+
+  try {
+    const allTabs = await chrome.tabs.query({});
+    for (const tab of allTabs) {
+      const tabId = Number(tab?.id);
+      const rawUrl = String(tab?.url || '').trim();
+      if (!Number.isFinite(tabId) || !rawUrl || !/^https?:\/\//i.test(rawUrl)) continue;
+      try {
+        const origin = new URL(rawUrl).origin;
+        if (isProtectedOrigin(origin)) {
+          targetTabIds.add(tabId);
+        }
+      } catch {}
+    }
+  } catch (error) {
+    bgLog('扫描受保护应用标签页失败', { reason, error: error?.message || 'unknown' });
+  }
+
+  if (!targetTabIds.size) {
+    bgLog('全局会话销毁：无可通知标签页', {
+      reason,
+      activeSessionCount: entries.length,
+      protectedOrigins: PROTECTED_APP_ORIGINS.size
+    });
+    LoginSession.sessions.clear();
+    LaunchGate.grantsByTab.clear();
+    TabTaskIndex.records.clear();
+    return;
+  }
+
+  bgLog('全局会话销毁开始', {
+    reason,
+    activeSessionCount: entries.length,
+    notifyTabCount: targetTabIds.size
+  });
+
+  for (const numTabId of targetTabIds) {
+    const tabId = String(numTabId);
 
     try {
       chrome.tabs.sendMessage(
@@ -655,117 +825,65 @@ async function revokeAllAppSessions(reason = 'topiam_logout') {
 }
 
 // 【诊断】LoginSession 对象创建完成
-console.log('[TopIAM BG] ✅ LoginSession 对象已创建，会话监控即将启动，会话有效期：10000ms');
-
-// 定期清理过期会话和监控会话状态
-// 注：使用 setInterval 在 Service Worker 中是可靠的，因为 Service Worker 在浏览器运行期间持续存在
-const sessionMonitorInterval = setInterval(async () => {
-  await probeTopIamAuthByCookies('session_monitor');
-
-  const nowHeartbeat = Date.now();
-  if (isTopIamAuthenticated() && nowHeartbeat - TOPIAM_HEARTBEAT_LAST_CHECK_AT >= TOPIAM_HEARTBEAT_INTERVAL_MS) {
-    TOPIAM_HEARTBEAT_LAST_CHECK_AT = nowHeartbeat;
-    const heartbeat = await probeTopIamAuthByCurrentUserApi('session_monitor_heartbeat');
-
-    if (heartbeat.decisive && !heartbeat.authenticated) {
-      if (nowHeartbeat - TOPIAM_HEARTBEAT_FAIL.lastAt > 90000) {
-        TOPIAM_HEARTBEAT_FAIL = { count: 0, lastAt: nowHeartbeat, reason: '' };
-      }
-      TOPIAM_HEARTBEAT_FAIL.count += 1;
-      TOPIAM_HEARTBEAT_FAIL.lastAt = nowHeartbeat;
-      TOPIAM_HEARTBEAT_FAIL.reason = heartbeat.reason || 'unknown';
-
-      bgLog('TopIAM current_user 心跳失败', {
-        reason: TOPIAM_HEARTBEAT_FAIL.reason,
-        failCount: TOPIAM_HEARTBEAT_FAIL.count,
-        threshold: TOPIAM_HEARTBEAT_FAIL_THRESHOLD
-      });
-
-      if (TOPIAM_HEARTBEAT_FAIL.count >= TOPIAM_HEARTBEAT_FAIL_THRESHOLD && isTopIamAuthenticated()) {
-        setTopIamAuthState(false, `heartbeat_${TOPIAM_HEARTBEAT_FAIL.reason}`);
-        await revokeAllAppSessions('topiam_session_expired_heartbeat');
-      }
-    }
-  }
-
-  // 【修复】先检测过期会话并发送通知，再清理
-  // 步骤1：识别所有过期的会话（但先不删除）
-  const now = Date.now();
-  const expiredSessions = [];
-  for (const [tabId, session] of LoginSession.sessions.entries()) {
-    if (session.expiresAt <= now) {
-      expiredSessions.push({ tabId, session });
-    }
-  }
-  
-  // 步骤2：向所有过期会话的标签页发送通知
-  for (const { tabId, session } of expiredSessions) {
-    try {
-      bgLog('【后台监控】检测到会话过期，通知标签页', { tabId, username: session.username });
-      
-      // 【关键修复】tabId 存储为字符串，但 chrome.tabs.sendMessage 需要整数
-      const numTabId = parseInt(tabId, 10);
-      
-      chrome.tabs.sendMessage(
-        numTabId,
-        { action: 'enforceSessionExpiration' },
-        { frameId: 0 }, // 仅向主 frame 发送
-        (response) => {
-          if (chrome.runtime.lastError) {
-            bgLog('通知会话过期失败（标签页可能已关闭）', { 
-              tabId, 
-              error: chrome.runtime.lastError.message 
-            });
-          } else if (response?.success) {
-            bgLog('✓ 会话过期通知已发送并被处理', { tabId });
-          }
-        }
-      );
-    } catch (error) {
-      bgLog('发送会话过期通知异常', { tabId, error: error?.message });
-    }
-  }
-  
-  // 步骤3：清理过期会话
-  LoginSession.cleanup();
-  
-  // 步骤4：监控活跃标签页的会话过期状态
-  try {
-    const allTabs = await chrome.tabs.query({});
-    
-    // 【诊断】记录所有活跃会话状态（每次都打印，不管是否有会话）
-    const sessionSummary = [];
-    for (const [key, value] of LoginSession.sessions.entries()) {
-      const timeLeft = Math.max(0, value.expiresAt - Date.now());
-      sessionSummary.push({ 
-        tabId: key, 
-        username: value.username, 
-        timeLeftMs: timeLeft,
-        isExpired: timeLeft === 0 
-      });
-    }
-    
-    // 总是打印监控状态，便于诊断
-    bgLog('【会话监控周期执行】', { 
-      activeSessions: sessionSummary.length,
-      openTabs: allTabs.length,
-      sessions: sessionSummary 
-    });
-  } catch (error) {
-    bgLog('会话监控循环异常', { error: error?.message });
-  }
-}, 5000);
-
-// 【诊断】监控循环已启动
-console.log('[TopIAM BG] ✅ 会话监控循环已启动，每 5000ms 执行一次');
+console.log('[TopIAM BG] ✅ LoginSession 对象已创建，会话有效期默认30分钟（按过期时间精确调度）');
 
 let TOPIAM_DOMAINS = [];
 let PROTECTED_APP_ORIGINS = new Set();
-const ENABLE_NAVIGATION_INTERCEPT = true;
+const ENABLE_NAVIGATION_INTERCEPT = false;
 const PREFETCH_GHOST_TABS = new Map();
 const PREFETCH_SESSIONS = new Map();
 const PREFETCH_INTERCEPT_LOCK_MS = 15000;
 const PREFETCH_INTERCEPT_LOCKS = new Map();
+const TAB_CREATE_GUARD_WINDOW_MS = 12000;
+const TAB_CREATE_GUARD_MAX_IN_WINDOW = 4;
+const TAB_CREATE_COOLDOWN_MS = 60000;
+const DISPATCH_DEDUP_WINDOW_MS = 8000;
+const TAB_CREATE_TIMESTAMPS = [];
+let TAB_CREATE_BLOCK_UNTIL = 0;
+const RECENT_DISPATCHES = new Map();
+
+function gcRecentDispatches(now = Date.now()) {
+  for (const [key, ts] of RECENT_DISPATCHES.entries()) {
+    if (now - Number(ts || 0) > DISPATCH_DEDUP_WINDOW_MS) {
+      RECENT_DISPATCHES.delete(key);
+    }
+  }
+}
+
+function canCreateTabNow(reason = 'unknown') {
+  const now = Date.now();
+  if (now < TAB_CREATE_BLOCK_UNTIL) {
+    bgLog('触发新标签保险丝：当前处于冷却期，拒绝创建标签', {
+      reason,
+      blockMsLeft: TAB_CREATE_BLOCK_UNTIL - now
+    });
+    return false;
+  }
+
+  while (TAB_CREATE_TIMESTAMPS.length && now - TAB_CREATE_TIMESTAMPS[0] > TAB_CREATE_GUARD_WINDOW_MS) {
+    TAB_CREATE_TIMESTAMPS.shift();
+  }
+
+  if (TAB_CREATE_TIMESTAMPS.length >= TAB_CREATE_GUARD_MAX_IN_WINDOW) {
+    TAB_CREATE_BLOCK_UNTIL = now + TAB_CREATE_COOLDOWN_MS;
+    bgLog('触发新标签保险丝：短时间创建过多，进入冷却', {
+      reason,
+      inWindow: TAB_CREATE_TIMESTAMPS.length,
+      windowMs: TAB_CREATE_GUARD_WINDOW_MS,
+      cooldownMs: TAB_CREATE_COOLDOWN_MS
+    });
+    return false;
+  }
+
+  TAB_CREATE_TIMESTAMPS.push(now);
+  return true;
+}
+
+async function guardedTabsCreate(createProperties, reason = 'unknown') {
+  // 紧急稳定模式：仅保留日志，不再阻断创建，避免误伤正常链路
+  canCreateTabNow(reason);
+  return chrome.tabs.create(createProperties);
+}
 
 function setPrefetchInterceptLock(tabId) {
   if (typeof tabId !== 'number') return;
@@ -801,6 +919,34 @@ function isTopIamUrl(urlLike) {
   }
 }
 
+function isTopIamRelayLikeUrl(urlLike) {
+  try {
+    const parsed = new URL(urlLike);
+    if (!isTopIamUrl(parsed.href)) return false;
+    const path = String(parsed.pathname || '').toLowerCase();
+    return /\/api\/v1\/authorize\/form\/[^/]+\/initiator/.test(path)
+      || /\/api\/v1\/user\/app\/initiator\//.test(path)
+      || /\/authorize\/form\//.test(path)
+      || /\/initiator(?:\/|$)/.test(path)
+      || /\/form-fill(?:\/|$)/.test(path)
+      || /\/auto-login(?:\/|$)/.test(path)
+      || /^\/portal\/app(?:\/|$)/.test(path);
+  } catch {
+    return true;
+  }
+}
+
+function isDispatchablePrefetchTarget(urlLike) {
+  try {
+    const parsed = new URL(urlLike);
+    const protocol = String(parsed.protocol || '').toLowerCase();
+    if (protocol !== 'http:' && protocol !== 'https:') return false;
+    return !isTopIamRelayLikeUrl(parsed.href);
+  } catch {
+    return false;
+  }
+}
+
 function isTopIamLogoutRequest(details) {
   if (!details || String(details.method || '').toUpperCase() !== 'POST') return false;
   try {
@@ -830,6 +976,8 @@ function triggerImmediateTopIamLogout(source = 'topiam_logout_api') {
     updatedAt: now,
     source
   };
+  // 清除 Cookie 指纹
+  TOPIAM_EMPLOYEE_COOKIE_FINGERPRINT = '';
   chrome.storage.local.set({ [TOPIAM_IDENTITY_KEY]: TOPIAM_IDENTITY }, () => {});
   setTopIamAuthState(false, source);
 
@@ -853,6 +1001,117 @@ function isCookieDomainMatch(cookieDomain, host) {
   if (!normalizedCookieDomain || !normalizedHost) return false;
   return normalizedHost === normalizedCookieDomain || normalizedHost.endsWith(`.${normalizedCookieDomain}`);
 }
+
+function isTopIamCookieDomain(domainLike) {
+  const cookieDomain = normalizeCookieDomain(domainLike);
+  if (!cookieDomain) return false;
+  return (TOPIAM_DOMAINS || []).some((domain) => {
+    const normalized = normalizeTopIamDomain(domain);
+    if (!normalized) return false;
+    return cookieDomain === normalized || cookieDomain.endsWith(`.${normalized}`);
+  });
+}
+
+let TOPIAM_COOKIE_CHANGE_DEBOUNCE_TIMER = null;
+let TOPIAM_COOKIE_CHANGE_EVENT_AT = 0;
+
+chrome.cookies.onChanged.addListener(async (changeInfo) => {
+  try {
+    const cookie = changeInfo?.cookie;
+    if (!cookie) return;
+    
+    const cookieName = String(cookie.name || '').toLowerCase();
+    const isDomain = isTopIamCookieDomain(cookie.domain);
+    
+    // 只关注 topiam-employee-cookie 的变化
+    if (cookieName !== 'topiam-employee-cookie') return;
+    if (!isDomain) return;
+
+    const currentValue = String(cookie.value || '').trim();
+    const wasRemoved = Boolean(changeInfo?.removed);
+    const fingerprint = TOPIAM_EMPLOYEE_COOKIE_FINGERPRINT;
+
+    bgLog('检测到 topiam-employee-cookie 变化', {
+      removed: wasRemoved,
+      fingerprintSet: Boolean(fingerprint),
+      fingerprintMatch: currentValue === fingerprint,
+      cause: String(changeInfo?.cause || '')
+    });
+
+    // 如果还没有设置指纹（首次登录），直接返回
+    if (!fingerprint) {
+      bgLog('首次登录状态，尚未设置会话指纹，忽略此次变化');
+      return;
+    }
+
+    // 如果 Cookie 被移除或值改变，则会话已过期
+    const sessionExpired = wasRemoved || (currentValue !== fingerprint);
+    if (!sessionExpired) {
+      bgLog('topiam-employee-cookie 值未改变，会话仍有效');
+      return;
+    }
+
+    TOPIAM_COOKIE_CHANGE_EVENT_AT = Date.now();
+    if (TOPIAM_COOKIE_CHANGE_DEBOUNCE_TIMER) {
+      clearTimeout(TOPIAM_COOKIE_CHANGE_DEBOUNCE_TIMER);
+    }
+
+    bgLog('检测到会话 Cookie 值变化（进入稳定性检测）', {
+      removed: wasRemoved,
+      cause: String(changeInfo?.cause || '')
+    });
+
+    TOPIAM_COOKIE_CHANGE_DEBOUNCE_TIMER = setTimeout(async () => {
+      const wasAuthenticated = isTopIamAuthenticated();
+
+      bgLog('会话过期检测完成（基于 Cookie 值变化）', {
+        elapsedMs: Date.now() - TOPIAM_COOKIE_CHANGE_EVENT_AT,
+        wasAuthenticated
+      });
+
+      if (wasAuthenticated) {
+        // 清除指纹，表示当前没有有效会话
+        TOPIAM_EMPLOYEE_COOKIE_FINGERPRINT = '';
+        
+        // 重置心跳状态：向所有 TopIAM 页面发送消息，让它们重新执行心跳探测
+        try {
+          const allTabs = await chrome.tabs.query({});
+          for (const tab of allTabs) {
+            // 只向 TopIAM 域名的页面发送
+            if (TOPIAM_DOMAINS.length === 0) continue;
+            
+            const tabUrl = String(tab?.url || '').trim().toLowerCase();
+            const isTopIamTab = TOPIAM_DOMAINS.some((domain) => {
+              const normalizedDomain = String(domain || '').trim().toLowerCase();
+              return tabUrl.includes(normalizedDomain);
+            });
+
+            if (isTopIamTab && typeof tab.id === 'number') {
+              try {
+                chrome.tabs.sendMessage(tab.id, {
+                  action: 'resetHeartbeatProbe',
+                  reason: 'employee_cookie_changed'
+                }, { frameId: 0 }, () => {
+                  if (chrome.runtime.lastError) {
+                    // 页面可能关闭或不响应，忽略
+                  }
+                });
+              } catch (error) {
+                // 忽略发送失败
+              }
+            }
+          }
+        } catch (error) {
+          bgLog('重置心跳状态失败', { error: error?.message });
+        }
+
+        await revokeAllAppSessions('topiam_session_expired_employee_cookie_changed');
+      }
+    }, 1200);
+  } catch (error) {
+    bgLog('处理 Cookie 变化事件异常', { error: error?.message || 'unknown' });
+  }
+});
 
 async function clearCookiesForOrigin(originUrl) {
   const parsed = new URL(originUrl);
@@ -1112,10 +1371,10 @@ function extractCredentialsFromFormData(formData) {
 }
 
 async function prefetchInitLoginAndDispatch(originalTabId, initLoginUrl, appMeta, options = {}) {
-  const ghostTab = await chrome.tabs.create({
+  const ghostTab = await guardedTabsCreate({
     url: initLoginUrl,
     active: false
-  });
+  }, 'prefetch_ghost_tab');
 
   const ghostTabId = ghostTab.id;
   if (typeof ghostTabId !== 'number') {
@@ -1172,6 +1431,13 @@ async function prefetchInitLoginAndDispatch(originalTabId, initLoginUrl, appMeta
     const tryDispatchFromFallback = async (targetUrl, reason) => {
       if (!state.username || !state.password || !targetUrl) return false;
       if (done) return true;
+      if (!isDispatchablePrefetchTarget(targetUrl)) {
+        sendMonitorDebug(originalTabId, '跳过预取兜底派发：目标仍为TopIAM中转页', {
+          reason,
+          targetUrl
+        });
+        return false;
+      }
 
       const dispatchPayload = {
         sourceUrl: initLoginUrl,
@@ -1213,6 +1479,68 @@ async function prefetchInitLoginAndDispatch(originalTabId, initLoginUrl, appMeta
       } catch (error) {
         await finish(error);
         return true;
+      }
+    };
+
+    const tryDispatchFromCache = async (targetUrl, reason) => {
+      if (!targetUrl || done) return false;
+      if (!isDispatchablePrefetchTarget(targetUrl)) {
+        sendMonitorDebug(originalTabId, '跳过预取缓存兜底：目标仍为TopIAM中转页', {
+          reason,
+          targetUrl
+        });
+        return false;
+      }
+      try {
+        const cached = await getEncryptedCredentialCache({
+          appId: appMeta?.appId || '',
+          appName: appMeta?.appName || '',
+          sourceUrl: initLoginUrl,
+          targetUrl
+        });
+
+        if (!cached?.username || !cached?.password) {
+          return false;
+        }
+
+        const dispatchPayload = {
+          sourceUrl: initLoginUrl,
+          targetUrl,
+          submitMethod: cached.submitMethod || 'post',
+          username: cached.username,
+          password: cached.password,
+          extra: cached.extra || {},
+          appId: appMeta?.appId || '',
+          appName: appMeta?.appName || '',
+          openInNewTab: Boolean(options.openInNewTab),
+          destinationTabId: keepGhostAsDestination ? ghostTabId : undefined
+        };
+
+        sendMonitorDebug(originalTabId, '触发预取缓存兜底派发', {
+          reason,
+          targetUrl,
+          username: cached.username,
+          hasPassword: Boolean(cached.password)
+        });
+
+        chrome.tabs.onUpdated.removeListener(onUpdated);
+        clearTimeout(timeoutId);
+        PREFETCH_SESSIONS.delete(ghostTabId);
+        PREFETCH_GHOST_TABS.delete(ghostTabId);
+
+        await dispatchTaskToTarget(originalTabId, dispatchPayload);
+
+        if (!keepGhostAsDestination) {
+          try {
+            await chrome.tabs.remove(ghostTabId);
+          } catch (error) {}
+        }
+
+        done = true;
+        resolve();
+        return true;
+      } catch (error) {
+        return false;
       }
     };
 
@@ -1261,6 +1589,10 @@ async function prefetchInitLoginAndDispatch(originalTabId, initLoginUrl, appMeta
           url: observedUrl
         });
 
+        if (await tryDispatchFromCache(observedUrl, 'leave_topiam_cache_fallback')) {
+          return;
+        }
+
         if (await tryDispatchFromFallback(observedUrl, 'leave_topiam_without_post_capture')) {
           return;
         }
@@ -1291,6 +1623,10 @@ async function prefetchInitLoginAndDispatch(originalTabId, initLoginUrl, appMeta
             if (state.extractedTargetUrl) {
               const normalized = normalizeTargetUrl(state.extractedTargetUrl, observedUrl);
               if (await tryDispatchFromFallback(normalized, 'initiator_dom_extract')) {
+                return;
+              }
+            } else {
+              if (await tryDispatchFromCache(observedUrl, 'initiator_dom_extract_empty_cache_fallback')) {
                 return;
               }
             }
@@ -1361,6 +1697,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   if (!isFormFill) return;
 
   bgLog('捕获导航型表单代填跳转', { tabId: details.tabId, url: details.url, isFormInitiator });
+  setPrefetchInterceptLock(details.tabId);
 
   chrome.tabs.update(details.tabId, {
     url: 'data:text/html,<html><head><style>body{background:#f0f2f5;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;font-family:system-ui;}</style></head><body><div style="text-align:center;color:#1890ff;"><div style="font-size:48px;margin-bottom:20px;">🔐</div><div>TopIAM插件接管中...</div></div></body></html>'
@@ -1373,10 +1710,10 @@ async function extractAndRedirect(formFillUrl, originalTabId) {
   let ghostTabId;
 
   try {
-    const ghostTab = await chrome.tabs.create({
+    const ghostTab = await guardedTabsCreate({
       url: formFillUrl,
       active: false
-    });
+    }, 'navigation_extract_ghost_tab');
     ghostTabId = ghostTab.id;
 
     await waitForTabLoad(ghostTabId);
@@ -1453,7 +1790,8 @@ async function extractAndRedirect(formFillUrl, originalTabId) {
     chrome.tabs.update(originalTabId, { url: target.href });
   } catch (error) {
     console.error(`${BG_LOG_PREFIX} 导航链路提取失败`, error);
-    chrome.tabs.update(originalTabId, { url: formFillUrl });
+    // 避免回退到同一 formFillUrl 触发二次拦截导致循环
+    clearPrefetchInterceptLock(originalTabId);
   } finally {
     if (ghostTabId) {
       chrome.tabs.remove(ghostTabId).catch(() => {});
@@ -1462,6 +1800,28 @@ async function extractAndRedirect(formFillUrl, originalTabId) {
 }
 
 async function dispatchTaskToTarget(originalTabId, payload) {
+  gcRecentDispatches();
+  const dedupKey = [
+    String(originalTabId || ''),
+    String(payload?.sourceUrl || ''),
+    String(payload?.targetUrl || ''),
+    String(payload?.username || ''),
+    String(Boolean(payload?.openInNewTab))
+  ].join('|');
+  const now = Date.now();
+  const last = Number(RECENT_DISPATCHES.get(dedupKey) || 0);
+  if (last && now - last < DISPATCH_DEDUP_WINDOW_MS) {
+    bgLog('拦截重复任务派发（去重命中）', {
+      originalTabId,
+      dedupWindowMs: DISPATCH_DEDUP_WINDOW_MS,
+      elapsedMs: now - last,
+      sourceUrl: payload?.sourceUrl || '',
+      targetUrl: payload?.targetUrl || ''
+    });
+    return;
+  }
+  RECENT_DISPATCHES.set(dedupKey, now);
+
   const openInNewTab = Boolean(payload.openInNewTab);
   const preferredDestinationTabId = Number.isInteger(payload.destinationTabId) ? payload.destinationTabId : null;
   bgLog('收到表单拦截派发请求', {
@@ -1505,10 +1865,10 @@ async function dispatchTaskToTarget(originalTabId, payload) {
   let destinationTabId = preferredDestinationTabId || originalTabId;
 
   if (openInNewTab && !preferredDestinationTabId) {
-    const created = await chrome.tabs.create({
+    const created = await guardedTabsCreate({
       url: 'about:blank',
       active: true
-    });
+    }, 'dispatch_destination_tab');
     if (typeof created?.id !== 'number') {
       throw new Error('创建目标标签页失败');
     }
@@ -1538,18 +1898,42 @@ async function dispatchTaskToTarget(originalTabId, payload) {
     target: target.href,
     openInNewTab
   });
-  await chrome.tabs.update(destinationTabId, {
+
+  try {
+    await chrome.tabs.update(destinationTabId, { active: true });
+  } catch (error) {}
+
+  const updatedTab = await chrome.tabs.update(destinationTabId, {
     url: target.href,
-    active: openInNewTab ? true : undefined
+    active: true
+  });
+
+  const activeWindowId = Number.isInteger(updatedTab?.windowId) ? updatedTab.windowId : null;
+  if (typeof activeWindowId === 'number') {
+    try {
+      await chrome.windows.update(activeWindowId, { focused: true });
+    } catch (error) {
+      bgLog('聚焦目标窗口失败（不影响跳转）', {
+        tabId: destinationTabId,
+        windowId: activeWindowId,
+        error: error?.message || 'unknown'
+      });
+    }
+  }
+
+  Promise.resolve().then(async () => {
+    try {
+      const refocused = await chrome.tabs.update(destinationTabId, { active: true });
+      const refocusWindowId = Number.isInteger(refocused?.windowId) ? refocused.windowId : activeWindowId;
+      if (typeof refocusWindowId === 'number') {
+        await chrome.windows.update(refocusWindowId, { focused: true });
+      }
+    } catch (error) {}
   });
 }
 
 function normalizeTargetUrl(rawUrl, baseUrl) {
   const parsed = baseUrl ? new URL(rawUrl, baseUrl) : new URL(rawUrl);
-  if (parsed.protocol === 'https:' && isPrivateIpV4(parsed.hostname)) {
-    bgLog('检测到私网IP HTTPS，自动降级到HTTP', { from: rawUrl });
-    parsed.protocol = 'http:';
-  }
   return parsed.href;
 }
 
@@ -1765,11 +2149,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // 这样可以支持同一个凭据被多次读取（比如重试、iframe等场景）
     bgLog('凭据读取成功，保留凭据以支持二次读取', { taskId: request.taskId });
     
+    // 从 TopIAM 身份信息中获取 fullName，用于水印显示
+    const identity = getTopIamIdentity();
+    
     sendResponse({
       success: true,
       username: data.username,
       password: data.password,
-      extra: data.extra
+      extra: data.extra,
+      fullName: identity?.fullName || data.username
     });
     return true;
   }
@@ -1806,12 +2194,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
 
-    setTopIamIdentity(username, source, fullName);
-    setTopIamAuthState(true, source);
-    sendResponse({ 
-      success: true, 
-      username: getTopIamIdentity().username,
-      fullName: getTopIamIdentity().fullName || ''
+    setTopIamIdentity(username, source, fullName).then(() => {
+      setTopIamAuthState(true, source);
+      sendResponse({ 
+        success: true, 
+        username: getTopIamIdentity().username,
+        fullName: getTopIamIdentity().fullName || ''
+      });
+    }).catch((error) => {
+      bgLog('同步TopIAM身份异常', { error: error?.message });
+      sendResponse({ success: false, error: error?.message || 'unknown' });
     });
     return true;
   }
@@ -1836,6 +2228,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       updatedAt: Date.now(),
       source
     };
+    // 清除 Cookie 指纹，表示会话已结束
+    TOPIAM_EMPLOYEE_COOKIE_FINGERPRINT = '';
     setTopIamAuthState(false, source);
     chrome.storage.local.set({ [TOPIAM_IDENTITY_KEY]: TOPIAM_IDENTITY }, () => {});
 
@@ -1857,9 +2251,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     const source = String(request.source || sender?.url || 'auth_probe');
 
     if (authenticated && username) {
-      setTopIamIdentity(username, source, fullName);
-      setTopIamAuthState(true, source);
-      sendResponse({ success: true, authenticated: true });
+      setTopIamIdentity(username, source, fullName).then(() => {
+        setTopIamAuthState(true, source);
+        sendResponse({ success: true, authenticated: true });
+      }).catch((error) => {
+        bgLog('报告TopIAM认证状态异常', { error: error?.message });
+        sendResponse({ success: false, error: error?.message || 'unknown' });
+      });
       return true;
     }
 
@@ -1923,6 +2321,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  if (request.action === 'checkTopIamCookieStability') {
+    checkTopIamCookieStability()
+      .then((result) => {
+        sendResponse({
+          success: true,
+          authenticated: isTopIamAuthenticated(),
+          ...result
+        });
+      })
+      .catch((error) => {
+        sendResponse({
+          success: false,
+          authenticated: isTopIamAuthenticated(),
+          stable: false,
+          reason: 'check_error',
+          error: error?.message || 'unknown'
+        });
+      });
+    return true;
+  }
+
   if (request.action === 'checkAccessPolicy') {
     const pageUrl = request.url;
     const hasTask = Boolean(request.hasTask);
@@ -1934,7 +2353,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     ])
       .then(() => {
         const page = new URL(pageUrl);
-        const isProtected = PROTECTED_APP_ORIGINS.has(page.origin);
+        const isProtected = isProtectedOrigin(page.origin);
         if (!isProtected || hasTask) {
           sendResponse({ allowed: true, reason: 'not_protected_or_has_task' });
           return;
@@ -1962,7 +2381,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         });
 
         if (!topiamAuthenticated) {
-          sendResponse({ allowed: false, reason: 'session_expired' });
+          if (grantedViaLaunchGate || sessionValid) {
+            bgLog('TopIAM认证状态暂不可用，但存在有效会话/最近启动授权，放行访问', {
+              tabId,
+              pageOrigin: page.origin,
+              grantedViaLaunchGate,
+              sessionValid,
+              hadSessionEver
+            });
+            sendResponse({ allowed: true, reason: 'active_session_auth_state_pending' });
+            return;
+          }
+
+          if (hadSessionEver) {
+            sendResponse({ allowed: false, reason: 'session_expired' });
+          } else {
+            sendResponse({ allowed: false, reason: 'sso_required' });
+          }
           return;
         }
 
@@ -2065,6 +2500,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === 'clearSiteCookies') {
     const origin = String(request.origin || sender?.url || '').trim();
+    const clearReason = String(request.reason || 'unspecified').trim() || 'unspecified';
+    const senderTabId = Number(sender?.tab?.id);
+    const senderUrl = String(sender?.url || '').trim();
     if (!origin) {
       sendResponse({ success: false, error: 'empty_origin' });
       return true;
@@ -2074,10 +2512,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .then((result) => {
         bgLog('已执行应用cookie强制清理', {
           origin,
+          reason: clearReason,
+          senderTabId: Number.isFinite(senderTabId) ? senderTabId : null,
+          senderUrl,
           matched: result.matched,
           removed: result.removed
         });
-        sendResponse({ success: true, ...result });
+        sendResponse({ success: true, reason: clearReason, ...result });
       })
       .catch((error) => {
         sendResponse({ success: false, error: error?.message || 'clear_cookie_failed' });
@@ -2093,6 +2534,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       bgLog('已清除tab的待处理任务', { tabId });
     }
     sendResponse({ success: true });
+    return true;
+  }
+
+  if (request.action === 'clearCurrentTabSession') {
+    const tabId = sender?.tab?.id;
+    if (typeof tabId === 'number') {
+      LoginSession.endSession(tabId);
+      LaunchGate.grantsByTab.delete(String(tabId));
+      TabTaskIndex.remove(tabId);
+      bgLog('已清理当前标签页SSO会话与授权状态', {
+        tabId,
+        reason: request.reason || 'manual_clear'
+      });
+    }
+    sendResponse({ success: true, tabId: typeof tabId === 'number' ? tabId : null });
     return true;
   }
 
@@ -2175,12 +2631,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
 
-    if (!payload.targetUrl || !payload.username || !payload.password) {
-      bgLog('表单拦截数据不完整，放行原生提交', payload);
-      sendResponse({ ok: false, error: '表单数据不完整' });
-      return true;
-    }
-
     const enrichedPayload = {
       ...payload,
       appId: payload.appId || mapped?.appId || '',
@@ -2189,6 +2639,60 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     if (mapped && typeof senderTabId === 'number') {
       const session = PREFETCH_SESSIONS.get(senderTabId);
+
+      if (!enrichedPayload.targetUrl || !enrichedPayload.username || !enrichedPayload.password) {
+        getEncryptedCredentialCache({
+          appId: enrichedPayload.appId || mapped?.appId || '',
+          appName: enrichedPayload.appName || mapped?.appName || '',
+          sourceUrl: enrichedPayload.sourceUrl || sender?.url || '',
+          targetUrl: enrichedPayload.targetUrl || ''
+        })
+          .then(async (cached) => {
+            if (!cached?.username || !cached?.password || !enrichedPayload.targetUrl) {
+              bgLog('预取链路表单账密缺失且无可用缓存，放行原生提交', {
+                targetUrl: enrichedPayload.targetUrl || '',
+                appId: enrichedPayload.appId || '',
+                appName: enrichedPayload.appName || ''
+              });
+              sendResponse({ ok: false, error: '表单数据不完整' });
+              return;
+            }
+
+            const cachedDispatchPayload = {
+              ...enrichedPayload,
+              username: cached.username,
+              password: cached.password,
+              extra: cached.extra || enrichedPayload.extra || {},
+              sourceUrl: enrichedPayload.sourceUrl || sender?.url || '',
+              submitMethod: 'post',
+              openInNewTab: Boolean(mapped.openInNewTab),
+              destinationTabId: mapped.openInNewTab ? senderTabId : undefined
+            };
+
+            await dispatchTaskToTarget(tabId, cachedDispatchPayload);
+
+            if (session?.resolve) {
+              await session.resolve(cachedDispatchPayload);
+            } else {
+              PREFETCH_GHOST_TABS.delete(senderTabId);
+            }
+
+            bgLog('预取链路已使用缓存账密接管提交（避免HTTP原生不安全表单提示）', {
+              tabId,
+              targetUrl: enrichedPayload.targetUrl || '',
+              appId: enrichedPayload.appId || ''
+            });
+            sendResponse({ ok: true, fromCache: true });
+          })
+          .catch(async (error) => {
+            if (session?.reject) {
+              await session.reject(error);
+            }
+            sendResponse({ ok: false, error: error?.message || '预取缓存派发失败' });
+          });
+        return true;
+      }
+
       const dispatchPayload = {
         ...enrichedPayload,
         sourceUrl: enrichedPayload.sourceUrl || sender?.url || '',
@@ -2212,6 +2716,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           }
           sendResponse({ ok: false, error: error?.message || '预取派发失败' });
         });
+      return true;
+    }
+
+    if (!enrichedPayload.targetUrl || !enrichedPayload.username || !enrichedPayload.password) {
+      bgLog('表单拦截数据不完整，放行原生提交', enrichedPayload);
+      sendResponse({ ok: false, error: '表单数据不完整' });
       return true;
     }
 
@@ -2271,9 +2781,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         });
         if (cached?.username && cached?.password) {
           try {
+            const cachedTargetUrl = String(cached.targetUrl || '').trim();
+            if (!cachedTargetUrl || !isDispatchablePrefetchTarget(cachedTargetUrl)) {
+              throw new Error('缓存目标地址无效或仍为TopIAM中转页');
+            }
+
             const cachedPayload = {
               sourceUrl: initLoginUrl,
-              targetUrl: cached.targetUrl || initLoginUrl,
+              targetUrl: cachedTargetUrl,
               submitMethod: cached.submitMethod || 'post',
               username: cached.username,
               password: cached.password,
@@ -2299,13 +2814,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
 
         const failureMessage = String(error?.message || 'unknown');
-        const missingCredentialLike = /未捕获POST账密|未能提取账密|POST已捕获但未识别到账密字段|未识别到账密字段|账密|凭据/i.test(failureMessage);
+        const explicitNoDefaultAccount = /NO_DEFAULT_ACCOUNT|缺少默认账户|至少需要配置一个默认账户/i.test(failureMessage);
 
         sendMonitorDebug(tabId, '预取失败', { error: failureMessage });
+
         sendResponse({
           ok: false,
-          code: missingCredentialLike ? 'NO_DEFAULT_ACCOUNT' : 'PREFETCH_FAILED',
-          error: missingCredentialLike ? '至少需要配置一个默认账户' : (failureMessage || '预取失败')
+          code: explicitNoDefaultAccount ? 'NO_DEFAULT_ACCOUNT' : 'PREFETCH_INSUFFICIENT_CONTEXT',
+          error: explicitNoDefaultAccount ? '至少需要配置一个默认账户' : '预访问信息不足，未自动跳转应用'
         });
       });
     return true;
@@ -2315,12 +2831,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 chrome.alarms.create('cleanup', { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener(async () => {
   await probeTopIamAuthByCookies('alarm_cleanup');
+  await processExpiredSessions('alarm_cleanup');
   LaunchGate.cleanup();
   TabTaskIndex.cleanup();
+  scheduleNextSessionExpiryCheck('alarm_cleanup');
   bgLog('定时清理完成');
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  LoginSession.endSession(tabId);
   TabTaskIndex.remove(tabId);
   PREFETCH_GHOST_TABS.delete(tabId);
   PREFETCH_SESSIONS.delete(tabId);
@@ -2340,30 +2859,38 @@ chrome.webRequest.onBeforeRequest.addListener(
     const ghost = PREFETCH_GHOST_TABS.get(details.tabId);
     if (!ghost) return;
 
+    const method = String(details.method || '').toUpperCase();
+    if (method !== 'POST') return;
+
+    const requestUrl = String(details.url || '').trim();
+    if (!/^https?:\/\//i.test(requestUrl)) return;
+
     const formData = details.requestBody?.formData;
-    const extracted = extractCredentialsFromFormData(formData);
-    if (!extracted.username || !extracted.password) {
-      sendMonitorDebug(ghost.originalTabId, 'POST已捕获但未识别到账密字段', {
-        ghostTabId: details.tabId,
-        requestUrl: details.url,
-        formKeys: formData ? Object.keys(formData) : []
-      });
+    if (!formData || Object.keys(formData).length === 0) {
       return;
     }
 
+    const session = PREFETCH_SESSIONS.get(details.tabId);
+    if (!session) return;
+    if (session.postCaptureInFlight) return;
+
+    const extracted = extractCredentialsFromFormData(formData);
+    if (!extracted.username || !extracted.password) {
+      return;
+    }
+
+    session.postCaptureInFlight = true;
+
     sendMonitorDebug(ghost.originalTabId, '已从POST请求体提取到账密', {
       ghostTabId: details.tabId,
-      requestUrl: details.url,
+      requestUrl,
       username: extracted.username,
       hasPassword: Boolean(extracted.password)
     });
 
-    const session = PREFETCH_SESSIONS.get(details.tabId);
-    if (!session) return;
-
     const payload = {
       sourceUrl: '',
-      targetUrl: details.url,
+      targetUrl: requestUrl,
       submitMethod: 'post',
       username: extracted.username,
       password: extracted.password,
@@ -2381,6 +2908,7 @@ chrome.webRequest.onBeforeRequest.addListener(
         }
       })
       .catch(async (error) => {
+        session.postCaptureInFlight = false;
         sendMonitorDebug(ghost.originalTabId, 'POST提取后派发失败', {
           error: error?.message || 'unknown'
         });

@@ -7,16 +7,23 @@
   const IS_TOP_WINDOW = window.top === window;
 
   const TARGET_LOG_PREFIX = '[TopIAM Target]';
-  const TOPIAM_WATERMARK_CLASS = 'topiam-pro-layout-watermark';
+  const TOPIAM_WATERMARK_CLASS = 'topiam-extension-watermark-layer';
+  const TOPIAM_WATERMARK_LEGACY_CLASS = 'topiam-pro-layout-watermark';
   const TOPIAM_WATERMARK_SIZE = 332;
   const TOPIAM_RESET_RETRY_MARKER = '__topiam_reset_retry';
   const NON_STANDARD_LOGIN_ERROR = 'NON_STANDARD_LOGIN_SURFACE';
+  const DISCOVERED_APPS_STORAGE_KEY = 'discoveredApps';
+  const TOPIAM_BLOCK_CREDENTIAL_EVENT = '__TOPIAM_BLOCK_CREDENTIAL_STORE__';
+  const SSO_STATE_SYNC_INTERVAL_MS = 30000;
 
   let isSessionExpiring = false;
   let ssoStateSyncTimer = null;
   let watermarkUsername = '';
+  let watermarkRepairTimer = null;
   let bootHasResetRetryMarker = false;
   let forceRefreshPathRules = [];
+  let watermarkWhitelistUrlMap = new Map();
+  let watermarkWhitelistHostMap = new Map();
 
   function targetLog(message, payload) {
     if (typeof payload === 'undefined') {
@@ -45,8 +52,8 @@
     const loginForm = safeQuerySelector('form[action*="login" i], form[action*="signin" i], form[action*="auth" i], form[action*="sso" i]');
     if (loginForm) return true;
 
-    const href = String(window.location.href || '').toLowerCase();
-    if (/login|signin|sign-in|auth|sso|oauth|cas|passport/.test(href)) return true;
+    const pathLike = `${String(window.location.pathname || '').toLowerCase()} ${String(window.location.search || '').toLowerCase()} ${String(window.location.hash || '').toLowerCase()}`;
+    if (/login|signin|sign-in|auth|oauth|cas|passport|\/sso(?:\/|$)/.test(pathLike)) return true;
 
     return false;
   }
@@ -64,8 +71,8 @@
       const hasLoginForm = Boolean(doc.querySelector('form[action*="login" i], form[action*="signin" i], form[action*="auth" i], form[action*="sso" i]'));
       if (hasLoginForm) return true;
 
-      const href = String(doc.location?.href || '').toLowerCase();
-      return /login|signin|sign-in|auth|sso|oauth|cas|passport/.test(href);
+      const pathLike = `${String(doc.location?.pathname || '').toLowerCase()} ${String(doc.location?.search || '').toLowerCase()} ${String(doc.location?.hash || '').toLowerCase()}`;
+      return /login|signin|sign-in|auth|oauth|cas|passport|\/sso(?:\/|$)/.test(pathLike);
     } catch (error) {
       return false;
     }
@@ -165,6 +172,64 @@
     fallbackHardReload();
   }
 
+  function resolveSessionExpiredLoginUrl() {
+    const candidates = new Set();
+    const addCandidate = (input) => {
+      if (!input) return;
+      try {
+        const url = new URL(String(input), window.location.href);
+        if (!/^https?:$/i.test(url.protocol)) return;
+        if (url.origin !== window.location.origin) return;
+        url.searchParams.set('__topiam_session_expired', '1');
+        url.searchParams.set('_ts', String(Date.now()));
+        candidates.add(url.href);
+      } catch (error) {}
+    };
+
+    try {
+      const formActions = Array.from(document.querySelectorAll('form[action]'));
+      formActions.forEach((form) => {
+        const action = String(form.getAttribute('action') || '').trim();
+        if (/login|signin|sign-in|auth|sso|oauth|cas/i.test(action)) {
+          addCandidate(action);
+        }
+      });
+    } catch (error) {}
+
+    const commonPaths = [
+      '/login',
+      '/signin',
+      '/sign-in',
+      '/auth/login',
+      '/user/login',
+      '/account/login',
+      '/oauth/login',
+      '/cas/login'
+    ];
+    commonPaths.forEach((path) => addCandidate(path));
+
+    try {
+      const pathname = String(window.location.pathname || '/');
+      const inferred = pathname
+        .replace(/(start|home|index|main)(\.[a-z0-9]+)?$/i, (_m, _w, ext) => `login${ext || ''}`)
+        .replace(/(dashboard|portal)(\.[a-z0-9]+)?$/i, (_m, _w, ext) => `login${ext || ''}`);
+      if (inferred && inferred !== pathname) {
+        addCandidate(inferred);
+      }
+      if (/\.html?$/i.test(pathname)) {
+        addCandidate(pathname.replace(/[^/]+\.html?$/i, 'login.html'));
+      }
+    } catch (error) {}
+
+    const currentWithoutHash = String(window.location.href || '').split('#')[0];
+    for (const candidate of candidates.values()) {
+      if (candidate.split('#')[0] !== currentWithoutHash) {
+        return candidate;
+      }
+    }
+    return '';
+  }
+
   function normalizePathForMatch(pathLike) {
     const raw = String(pathLike || '').trim();
     if (!raw) return '/';
@@ -238,6 +303,8 @@
   function isLikelyNonStandardLoginSurface() {
     if (!IS_TOP_WINDOW) return false;
     if (isLikelyLoginContext()) return false;
+    if (hasLikelyLoggedInSurface()) return false;
+    if (isLikelyPostLoginPath()) return false;
 
     if (shouldForceRefreshCurrentPath()) {
       return true;
@@ -286,6 +353,13 @@
 
   function assertNotNonStandardLoginSurface(source = 'unknown') {
     if (!IS_TOP_WINDOW) return;
+    if (isLikelyPostLoginPath()) {
+      targetLog('当前URL更像登录后页面，跳过非标登录页中断', {
+        source,
+        href: window.location.href
+      });
+      return;
+    }
     if (!isLikelyNonStandardLoginSurface()) return;
     targetLog('命中非标准登录页，立即中断常规代填流程', {
       source,
@@ -361,7 +435,8 @@
       try {
         const cookieResult = await chrome.runtime.sendMessage({
           action: 'clearSiteCookies',
-          origin: location.origin
+          origin: location.origin,
+          reason: `force_reset_${String(reason || 'unknown')}`
         });
         targetLog('后台cookie清理结果', cookieResult || {});
         return cookieResult || { success: false };
@@ -514,10 +589,13 @@
   }
 
   class SmartFiller {
-    constructor(user, pass, extra) {
+    constructor(user, pass, extra, fullName = '') {
       this.user = user;
       this.pass = pass;
       this.extra = extra || {};
+      this.fullName = String(fullName || user || '').trim();
+      this.didFillPassword = false;
+      this.didSubmit = false;
     }
 
     async execute(strategy) {
@@ -579,6 +657,7 @@
     }
 
     hardenCredentialPersistence() {
+      this.activateCredentialStoreBlockWindow();
       document.querySelectorAll('form').forEach((form) => {
         form.setAttribute('autocomplete', 'off');
       });
@@ -590,6 +669,23 @@
           input.setAttribute('autocomplete', 'off');
         }
       });
+    }
+
+    activateCredentialStoreBlockWindow(durationMs = 2 * 60 * 1000) {
+      const safeDurationMs = Number.isFinite(Number(durationMs)) && Number(durationMs) > 0
+        ? Math.floor(Number(durationMs))
+        : 2 * 60 * 1000;
+      const payload = {
+        durationMs: Math.max(1000, Math.min(10 * 60 * 1000, safeDurationMs)),
+        source: 'content_target_autofill'
+      };
+
+      try {
+        window.dispatchEvent(new CustomEvent(TOPIAM_BLOCK_CREDENTIAL_EVENT, { detail: payload }));
+        targetLog('已请求 page-bridge 进入凭据存储拦截窗口', payload);
+      } catch (error) {
+        targetError('请求凭据存储拦截窗口失败', { error: error?.message || String(error) });
+      }
     }
 
     setNativeValue(element, value) {
@@ -623,6 +719,10 @@
       // 验证填充是否成功
       const valueAfterFill = element.value || '';
       const successful = valueAfterFill === stringValue;
+      const typeLike = String(element?.type || element?.getAttribute?.('type') || '').toLowerCase();
+      if (successful && typeLike === 'password') {
+        this.didFillPassword = true;
+      }
       targetLog('fillField 验证', {
         expected: stringValue.substring(0, 20),
         actual: valueAfterFill.substring(0, 20),
@@ -773,6 +873,7 @@
         hasOnclick: Boolean(button.onclick || button.getAttribute('onclick'))
       });
       this.triggerRealClick(button);
+      this.didSubmit = true;
       
       // 点击后等待，给页面和服务器足够的时间响应（AJAX请求、表单提交等）
       await this.sleep(800);
@@ -833,13 +934,14 @@
         if (!(node instanceof HTMLInputElement)) return false;
         const type = (node.type || '').toLowerCase();
         if (['hidden', 'file', 'checkbox', 'radio', 'button', 'submit', 'reset'].includes(type)) return false;
-        if (node.disabled || node.readOnly) return false;
+        if (node.disabled) return false;
+        if (node.readOnly && type !== 'password') return false;
         if (node.offsetParent === null && type !== 'password') return false;
         return true;
       });
 
       const readMeta = (node) => {
-        const type = (node.getAttribute('type') || '').toLowerCase();
+        const type = String(node.type || node.getAttribute('type') || '').toLowerCase();
         const name = (node.getAttribute('name') || '').toLowerCase();
         const id = (node.getAttribute('id') || '').toLowerCase();
         const placeholder = (node.getAttribute('placeholder') || '').toLowerCase();
@@ -1263,6 +1365,29 @@
           return true;
         }
 
+        const form = localPasswordEl?.form || null;
+        if (form && typeof form.requestSubmit === 'function') {
+          try {
+            form.requestSubmit();
+            this.didSubmit = true;
+            targetLog('未命中登录按钮，已执行 form.requestSubmit 兜底', { attempt: i + 1 });
+            return true;
+          } catch (error) {
+            targetLog('form.requestSubmit 兜底失败', { attempt: i + 1, error: error?.message });
+          }
+        }
+
+        if (form) {
+          try {
+            form.submit();
+            this.didSubmit = true;
+            targetLog('未命中登录按钮，已执行 form.submit 兜底', { attempt: i + 1 });
+            return true;
+          } catch (error) {
+            targetLog('form.submit 兜底失败', { attempt: i + 1, error: error?.message });
+          }
+        }
+
         if (i < 7) {
           await this.sleep(300);
         }
@@ -1435,7 +1560,8 @@
             type: 'TOPIAM_AUTO_FILL',
             username: this.user,
             password: this.pass,
-            extra: this.extra
+            extra: this.extra,
+            fullName: this.fullName || this.user
           }, '*');
           broadcastCount += 1;
           targetLog('fillIframe: 广播消息已发送', { frameIndex: index });
@@ -1478,7 +1604,8 @@
                   type: 'TOPIAM_AUTO_FILL',
                   username: this.user,
                   password: this.pass,
-                  extra: this.extra
+                  extra: this.extra,
+                  fullName: this.fullName || this.user
                 }, '*');
               } catch (e) {}
             });
@@ -1657,7 +1784,8 @@
             type: 'TOPIAM_AUTO_FILL',
             username: this.user,
             password: this.pass,
-            extra: this.extra
+            extra: this.extra,
+            fullName: this.fullName || this.user
           }, '*');
           targetLog('postMessage已发送', { iframeIndex: idx });
         } catch (e) {
@@ -1792,16 +1920,72 @@
   }
 
   function removeUserWatermark() {
-    const existing = document.querySelector(`.${TOPIAM_WATERMARK_CLASS}`);
-    if (existing) {
-      existing.remove();
-      targetLog('已移除用户水印层');
+    const selectors = [
+      `.${TOPIAM_WATERMARK_CLASS}[data-topiam-user]`,
+      `.${TOPIAM_WATERMARK_LEGACY_CLASS}[data-topiam-user]`,
+      `.${TOPIAM_WATERMARK_CLASS}`,
+      `.${TOPIAM_WATERMARK_LEGACY_CLASS}`
+    ];
+    const layers = selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)));
+    layers.forEach((layer) => {
+      try {
+        layer.remove();
+      } catch (error) {}
+    });
+    if (layers.length > 0) {
+      targetLog('已移除插件用户水印层', { count: layers.length });
     }
     watermarkUsername = '';
   }
 
+  function ensureWatermarkRepairLoop() {
+    if (!IS_TOP_WINDOW || watermarkRepairTimer) return;
+    watermarkRepairTimer = setInterval(() => {
+      try {
+        if (!watermarkUsername) return;
+        if (isTopIamPlatformPage()) return;
+        const layer = document.querySelector(`.${TOPIAM_WATERMARK_CLASS}[data-topiam-user]`);
+        if (!layer) {
+          ensureUserWatermark(watermarkUsername);
+          targetLog('检测到水印层缺失，已自动补挂载', { username: watermarkUsername });
+        }
+      } catch (error) {}
+    }, 2000);
+  }
+
+  function isTopIamPlatformPage() {
+    const host = String(window.location.hostname || '').toLowerCase();
+    const path = String(window.location.pathname || '').toLowerCase();
+    const href = String(window.location.href || '').toLowerCase();
+    const title = String(document.title || '').toLowerCase();
+
+    if (/topiam/.test(host) || /topiam/.test(path) || /topiam/.test(href) || /topiam/.test(title)) {
+      return true;
+    }
+
+    if (/^\/portal\/app(?:\/|$)/.test(path)
+      || /^\/login(?:\/|$)/.test(path)
+      || /^\/signin(?:\/|$)/.test(path)
+      || /^\/oauth(?:\/|$)/.test(path)
+      || /^\/cas(?:\/|$)/.test(path)
+      || /^\/auth\/login(?:\/|$)/.test(path)
+      || /\/api\/v1\/authorize\/form\//.test(path)
+      || /\/api\/v1\/user\/app\/initiator\//.test(path)) {
+      return true;
+    }
+
+    return Boolean(document.querySelector('[class*="topiam" i], [id*="topiam" i], script[src*="topiam" i], link[href*="topiam" i], meta[name*="topiam" i]'));
+  }
+
   function ensureUserWatermark(username) {
     if (!IS_TOP_WINDOW) return;
+    if (!isCurrentUrlWhitelistedByRealUrl()) {
+      targetLog('跳过水印注入：当前URL不在realTargetUrl白名单', {
+        href: window.location.href
+      });
+      removeUserWatermark();
+      return;
+    }
     const safeName = String(username || '').trim();
     if (!safeName) {
       removeUserWatermark();
@@ -1816,7 +2000,7 @@
       layer = document.createElement('div');
       layer.className = TOPIAM_WATERMARK_CLASS;
       layer.style.cssText = [
-        'z-index:9',
+        'z-index:2147483646',
         'position:fixed',
         'left:0',
         'top:0',
@@ -1826,7 +2010,7 @@
         'background-repeat:repeat',
         `background-size:${TOPIAM_WATERMARK_SIZE}px ${TOPIAM_WATERMARK_SIZE}px`
       ].join(';');
-      (document.body || document.documentElement).appendChild(layer);
+      (document.documentElement || document.body).appendChild(layer);
     }
 
     layer.style.backgroundImage = `url("${dataUrl}")`;
@@ -1844,15 +2028,29 @@
         username: String(response?.username || ''),
         topiamUsername: String(response?.topiamUsername || ''),
         topiamFullName: String(response?.topiamFullName || ''),
+        topiamAuthenticated: Boolean(response?.topiamAuthenticated),
         expiresAt: Number(response?.expiresAt || 0),
         timeLeftMs: Number(response?.timeLeftMs || 0)
       };
     } catch (error) {
-      return { isValid: false, hadSession: false, username: '', topiamUsername: '', topiamFullName: '', expiresAt: 0, timeLeftMs: 0 };
+      return { isValid: false, hadSession: false, username: '', topiamUsername: '', topiamFullName: '', topiamAuthenticated: false, expiresAt: 0, timeLeftMs: 0 };
     }
   }
 
-  function waitForPageChange() {
+  async function queryTopIamIdentity() {
+    try {
+      const response = await chrome.runtime.sendMessage({ action: 'getTopIamIdentity' });
+      return {
+        username: String(response?.username || '').trim(),
+        fullName: String(response?.fullName || '').trim(),
+        authenticated: Boolean(response?.authenticated)
+      };
+    } catch (error) {
+      return { username: '', fullName: '', authenticated: false };
+    }
+  }
+
+  function waitForPageChange(timeoutMs = 15000) {
     const originalUrl = window.location.href;
     const originalPathname = window.location.pathname;
     const originalHash = window.location.hash;
@@ -1939,10 +2137,10 @@
       const timeout = setTimeout(() => {
         if (!changeDetected) {
           cleanup();
-          targetLog('页面跳转检测超时（15秒）：未检测到URL改变、路由改变、页面重新加载或卸载，判定为失败');
+          targetLog('页面跳转检测超时：未检测到URL改变、路由改变、页面重新加载或卸载，判定为失败', { timeoutMs });
           resolve(false);
         }
-      }, 15000);
+      }, timeoutMs);
 
       const cleanup = () => {
         clearInterval(checkInterval);
@@ -2007,6 +2205,153 @@
     `;
     btn.onclick = () => location.reload();
     document.body.appendChild(btn);
+  }
+
+  function normalizeRealUrlForWhitelist(urlLike) {
+    try {
+      const parsed = new URL(String(urlLike || '').trim());
+      const protocol = String(parsed.protocol || '').toLowerCase();
+      if (protocol !== 'http:' && protocol !== 'https:') return '';
+      const path = String(parsed.pathname || '/').replace(/\/+$/, '') || '/';
+      return `${parsed.origin}${path}`;
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function normalizeHostForWhitelist(urlLike) {
+    try {
+      const parsed = new URL(String(urlLike || '').trim());
+      const protocol = String(parsed.protocol || '').toLowerCase();
+      if (protocol !== 'http:' && protocol !== 'https:') return '';
+      return String(parsed.hostname || '').toLowerCase();
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function isCurrentUrlWhitelistedByRealUrl() {
+    const currentNormalized = normalizeRealUrlForWhitelist(window.location.href);
+    const currentHost = normalizeHostForWhitelist(window.location.href);
+    if (!currentNormalized && !currentHost) return false;
+
+    const matchedUrlEntries = currentNormalized
+      ? (watermarkWhitelistUrlMap.get(currentNormalized) || [])
+      : [];
+    if (matchedUrlEntries.length > 0) {
+      targetLog('水印白名单命中(realTargetUrl)', {
+        matchType: 'url_exact',
+        currentNormalized,
+        currentHost,
+        matchedCount: matchedUrlEntries.length,
+        matchedEntries: matchedUrlEntries.slice(0, 3)
+      });
+      return true;
+    }
+
+    const matchedHostEntries = currentHost
+      ? (watermarkWhitelistHostMap.get(currentHost) || [])
+      : [];
+    if (matchedHostEntries.length > 0) {
+      targetLog('水印白名单命中(realTargetUrl)', {
+        matchType: 'host_fallback',
+        currentNormalized,
+        currentHost,
+        matchedCount: matchedHostEntries.length,
+        matchedEntries: matchedHostEntries.slice(0, 3)
+      });
+      return true;
+    }
+
+    targetLog('水印白名单未命中(realTargetUrl)', {
+      currentNormalized,
+      currentHost,
+      whitelistUrlSize: watermarkWhitelistUrlMap.size,
+      whitelistHostSize: watermarkWhitelistHostMap.size
+    });
+    return false;
+  }
+
+  function rebuildWatermarkWhitelist(discoveredApps) {
+    const list = Array.isArray(discoveredApps) ? discoveredApps : [];
+    const nextUrlMap = new Map();
+    const nextHostMap = new Map();
+
+    list.forEach((app) => {
+      const rawRealTargetUrl = String(app?.realTargetUrl || '').trim();
+      const normalized = normalizeRealUrlForWhitelist(rawRealTargetUrl);
+      const host = normalizeHostForWhitelist(rawRealTargetUrl);
+      if (!normalized && !host) return;
+
+      const entry = {
+        appId: String(app?.appId || '').trim(),
+        name: String(app?.name || '').trim(),
+        realTargetUrl: rawRealTargetUrl || normalized || ''
+      };
+
+      if (normalized) {
+        const urlEntries = nextUrlMap.get(normalized) || [];
+        urlEntries.push(entry);
+        nextUrlMap.set(normalized, urlEntries);
+      }
+
+      if (host) {
+        const hostEntries = nextHostMap.get(host) || [];
+        hostEntries.push(entry);
+        nextHostMap.set(host, hostEntries);
+      }
+    });
+
+    watermarkWhitelistUrlMap = nextUrlMap;
+    watermarkWhitelistHostMap = nextHostMap;
+
+    const samples = Array.from(watermarkWhitelistUrlMap.entries())
+      .slice(0, 3)
+      .map(([normalized, entries]) => ({
+        normalized,
+        appId: String(entries?.[0]?.appId || ''),
+        name: String(entries?.[0]?.name || ''),
+        realTargetUrl: String(entries?.[0]?.realTargetUrl || normalized)
+      }));
+
+    const hostSamples = Array.from(watermarkWhitelistHostMap.entries())
+      .slice(0, 3)
+      .map(([host, entries]) => ({
+        host,
+        appId: String(entries?.[0]?.appId || ''),
+        name: String(entries?.[0]?.name || ''),
+        realTargetUrl: String(entries?.[0]?.realTargetUrl || '')
+      }));
+
+    targetLog('已更新水印白名单(realTargetUrl)', {
+      size: watermarkWhitelistUrlMap.size,
+      hostSize: watermarkWhitelistHostMap.size,
+      sample: samples,
+      hostSample: hostSamples
+    });
+  }
+
+  function loadWatermarkWhitelist() {
+    chrome.storage.local.get([DISCOVERED_APPS_STORAGE_KEY], (result) => {
+      const apps = Array.isArray(result?.[DISCOVERED_APPS_STORAGE_KEY])
+        ? result[DISCOVERED_APPS_STORAGE_KEY]
+        : [];
+      rebuildWatermarkWhitelist(apps);
+    });
+  }
+
+  function watchWatermarkWhitelist() {
+    if (window.__topiamWatermarkWhitelistWatchBound) return;
+    window.__topiamWatermarkWhitelistWatchBound = true;
+
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName !== 'local') return;
+      if (!Object.prototype.hasOwnProperty.call(changes, DISCOVERED_APPS_STORAGE_KEY)) return;
+      const nextApps = Array.isArray(changes[DISCOVERED_APPS_STORAGE_KEY]?.newValue)
+        ? changes[DISCOVERED_APPS_STORAGE_KEY].newValue
+        : [];
+      rebuildWatermarkWhitelist(nextApps);
+    });
   }
 
   async function enforceAccessPolicy(hasTask) {
@@ -2089,11 +2434,130 @@
     return false;
   }
 
-  async function shouldSkipAutofillAsAlreadyLoggedIn() {
-    if (!IS_TOP_WINDOW) return false;
+  function hasLikelyLoggedInSurface() {
+    if (hasLikelyLoginSurface()) return false;
 
-    const href = String(window.location.href || '').toLowerCase();
-    if (/login|signin|sign-in|auth|sso|oauth|cas|passport/.test(href)) {
+    if (isLikelyPostLoginPath()) return true;
+
+    const selectors = [
+      '[class*="user" i]',
+      '[class*="avatar" i]',
+      '[class*="profile" i]',
+      '[class*="logout" i]',
+      '[id*="logout" i]',
+      '[data-user-name]',
+      '[data-username]'
+    ];
+    const hasUiMarker = selectors.some((selector) => {
+      try {
+        return Boolean(document.querySelector(selector));
+      } catch {
+        return false;
+      }
+    });
+
+    const bodyText = String(document.body?.innerText || '').slice(0, 5000).toLowerCase();
+    const hasTextMarker = /退出|注销|logout|sign\s*out|欢迎|welcome|个人中心|用户中心|我的账号/.test(bodyText);
+
+    return hasUiMarker || hasTextMarker;
+  }
+
+  function isLikelyPostLoginPath() {
+    const pathname = String(window.location.pathname || '').toLowerCase();
+    const search = String(window.location.search || '').toLowerCase();
+    const hash = String(window.location.hash || '').toLowerCase();
+    const combined = `${pathname} ${search} ${hash}`;
+    const normalizedPath = pathname.replace(/\/+$/, '') || '/';
+
+    const loginKeywords = /login|signin|sign-in|auth|oauth|cas|passport|账户登录|扫码登录/;
+    if (loginKeywords.test(combined)) return false;
+
+    const exactPostLoginPaths = new Set([
+      '/',
+      '/dashboard',
+      '/home',
+      '/index',
+      '/index.html',
+      '/main',
+      '/mainmenu',
+      '/menu',
+      '/app',
+      '/portal',
+      '/portal/main',
+      '/console',
+      '/workbench',
+      '/desktop',
+      '/overview'
+    ]);
+
+    if (exactPostLoginPaths.has(normalizedPath)) {
+      return true;
+    }
+
+    const prefixPostLoginPatterns = [
+      /^\/dashboard(?:\/|$)/,
+      /^\/menu(?:\/|$)/,
+      /^\/app(?:\/|$)/,
+      /^\/home(?:\/|$)/,
+      /^\/main(?:\/|$)/,
+      /^\/portal(?:\/|$)/,
+      /^\/console(?:\/|$)/,
+      /^\/workbench(?:\/|$)/,
+      /^\/desktop(?:\/|$)/,
+      /^\/overview(?:\/|$)/
+    ];
+    if (prefixPostLoginPatterns.some((rule) => rule.test(normalizedPath))) {
+      return true;
+    }
+
+    const postLoginKeywords = /mainmenu|dashboard|console|home|index|portal\/main|workbench|desktop|overview|welcome|url_name=mainmenu|url_name=menu|url_name=app/;
+    if (postLoginKeywords.test(combined)) {
+      return true;
+    }
+
+    const hasMenuLikeUi = Boolean(safeQuerySelector(
+      '[class*="menu" i], [class*="sidebar" i], [class*="nav" i], [class*="header" i], [id*="menu" i], [id*="nav" i]'
+    ));
+    const hasPasswordField = Boolean(safeQuerySelector('input[type="password"], input[name*="pass" i], input[id*="pass" i]'));
+
+    if (normalizedPath === '/' && !hasPasswordField) {
+      const rootHints = /dashboard|mainmenu|menu|app|console|home|workbench|desktop|overview|welcome/;
+      if (rootHints.test(`${search} ${hash}`) || hasMenuLikeUi) {
+        return true;
+      }
+    }
+
+    return hasMenuLikeUi && !hasPasswordField;
+  }
+
+  async function shouldSkipAutofillAsAlreadyLoggedIn(options = {}) {
+    if (!IS_TOP_WINDOW) return false;
+    if (options?.hasTask) {
+      const start = Date.now();
+      const maxWaitMs = 1200;
+      while (Date.now() - start < maxWaitMs) {
+        if (hasLikelyLoginSurface()) return false;
+        if (isLikelyPostLoginPath()) {
+          targetLog('当前存在有效taskId，命中登录后路径特征，跳过代填', {
+            waitedMs: Date.now() - start,
+            href: window.location.href
+          });
+          return true;
+        }
+        if (hasLikelyLoggedInSurface()) {
+          targetLog('当前存在有效taskId，但已命中登录后界面特征，跳过代填', {
+            waitedMs: Date.now() - start,
+            href: window.location.href
+          });
+          return true;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      return false;
+    }
+
+    const pathLike = `${String(window.location.pathname || '').toLowerCase()} ${String(window.location.search || '').toLowerCase()} ${String(window.location.hash || '').toLowerCase()}`;
+    if (/login|signin|sign-in|auth|oauth|cas|passport|\/sso(?:\/|$)/.test(pathLike)) {
       return false;
     }
 
@@ -2118,7 +2582,7 @@
       waitedMs: Date.now() - probeStart,
       href: window.location.href
     });
-    return true;
+    return hasLikelyLoggedInSurface();
   }
 
   async function startSessionAfterLogin(taskId, username, source = 'autofill_success') {
@@ -2171,6 +2635,27 @@
       targetLog('通知background清除taskId失败', { error: e?.message });
     }
 
+    try {
+      const sessionClearResponse = await chrome.runtime.sendMessage({
+        action: 'clearCurrentTabSession',
+        reason: 'session_expired'
+      });
+      targetLog('已通知background清除当前标签页会话', sessionClearResponse || {});
+    } catch (error) {
+      targetLog('通知background清除当前标签页会话失败', { error: error?.message || String(error) });
+    }
+
+    try {
+      const cookieResult = await chrome.runtime.sendMessage({
+        action: 'clearSiteCookies',
+        origin: window.location.origin,
+        reason: `session_expired_${String(trigger || 'unknown')}`
+      });
+      targetLog('会话过期后台cookie清理结果', cookieResult || {});
+    } catch (error) {
+      targetLog('会话过期后台cookie清理异常', { error: error?.message || String(error) });
+    }
+
     const cookiesToClear = [];
     document.cookie.split(';').forEach((cookie) => {
       const name = cookie.split('=')[0].trim();
@@ -2211,19 +2696,62 @@
     showSubmitNotice('⚠ SSO会话已过期，请重新登录');
 
     setTimeout(() => {
-      targetLog('🔄 【会话过期】即将重新加载页面...');
-      window.location.reload();
+      const loginUrl = resolveSessionExpiredLoginUrl();
+      if (loginUrl) {
+        targetLog('🔄 【会话过期】即将跳转登录页...', { loginUrl });
+        window.location.replace(loginUrl);
+      } else {
+        targetLog('🔄 【会话过期】未识别到登录页，回退为页面重载');
+        window.location.reload();
+      }
     }, 1500);
 
     targetLog('✓ 【会话过期】强制注销流程已完成，等待页面重新加载');
     return true;
   }
 
+  async function isManagedWatermarkContext() {
+    if (isTopIamPlatformPage()) return false;
+    const whitelisted = isCurrentUrlWhitelistedByRealUrl();
+    targetLog('水印上下文判定结果', {
+      href: window.location.href,
+      whitelisted
+    });
+    return whitelisted;
+  }
+
   async function synchronizeSsoState(source = 'poll') {
     if (!IS_TOP_WINDOW) return;
 
+    if (isTopIamPlatformPage()) {
+      return;
+    }
+
+    const managedContext = await isManagedWatermarkContext();
+    if (!managedContext) {
+      removeUserWatermark();
+      return;
+    }
+
+    const loginContext = isLikelyLoginContext();
     const state = await querySsoSessionState();
     const platformUser = String(state.topiamFullName || state.topiamUsername || state.username || '').trim();
+
+    if (loginContext) {
+      let loginPageUser = String(platformUser || watermarkUsername || '').trim();
+      if (!loginPageUser) {
+        const identity = await queryTopIamIdentity();
+        loginPageUser = String(identity.fullName || identity.username || '').trim();
+      }
+
+      if (loginPageUser) {
+        if (watermarkUsername !== loginPageUser) {
+          ensureUserWatermark(loginPageUser);
+        }
+        return;
+      }
+    }
+
     if (state.isValid && platformUser) {
       if (watermarkUsername !== platformUser) {
         ensureUserWatermark(platformUser);
@@ -2235,16 +2763,37 @@
 
     if (state.hadSession && !state.isValid && !isSessionExpiring) {
       await executeSessionExpirationFlow(`state_sync_${source}`);
+      return;
+    }
+
+    if (!state.topiamAuthenticated && !isSessionExpiring) {
+      try {
+        const policy = await chrome.runtime.sendMessage({
+          action: 'checkAccessPolicy',
+          url: location.href,
+          hasTask: false
+        });
+        if (policy && policy.allowed === false && policy.reason === 'session_expired') {
+          targetLog('命中访问策略 session_expired，触发会话过期流程', {
+            source,
+            href: location.href
+          });
+          await executeSessionExpirationFlow(`policy_${source}`);
+        }
+      } catch (error) {
+        targetLog('会话过期策略兜底检查失败', { error: error?.message || String(error) });
+      }
     }
   }
 
   function startSsoStateSync() {
     if (!IS_TOP_WINDOW || ssoStateSyncTimer) return;
 
+    ensureWatermarkRepairLoop();
     synchronizeSsoState('bootstrap').catch(() => {});
     ssoStateSyncTimer = setInterval(() => {
       synchronizeSsoState('interval').catch(() => {});
-    }, 10000);
+    }, SSO_STATE_SYNC_INTERVAL_MS);
 
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
@@ -2315,7 +2864,7 @@
       targetLog('检测到登录页回退且密码为空，触发自动重试', { retry: currentRetry + 1 });
 
       try {
-        const filler = new SmartFiller(auth.username, auth.password, auth.extra);
+        const filler = new SmartFiller(auth.username, auth.password, auth.extra, auth.fullName || '');
         await filler.execute(strategy);
       } catch (error) {
         targetError('自动重试代填失败', error);
@@ -2343,7 +2892,7 @@
     const strategy = detectStrategy();
     targetLog('检测到代填策略', { strategy });
     
-    const filler = new SmartFiller(auth.username, auth.password, auth.extra || {});
+    const filler = new SmartFiller(auth.username, auth.password, auth.extra || {}, auth.fullName || '');
     
     // 创建一个标志，用于检测页面是否被卸载
     let pageAboutToUnload = false;
@@ -2374,14 +2923,125 @@
     }
     
     window.removeEventListener('beforeunload', handleBeforeUnload);
-    
-    // 【简化】只要代填执行了，不抛异常，就认为成功
-    // 代填成功的标志：
-    // 1. pageAboutToUnload 为 true（表示页面要跳转或刷新）
-    // 2. 或者任何非异常的完成都视为成功（因为应用状态复杂，难以判断）
-    targetLog('代填流程已完成', { pageAboutToUnload, strategy });
-    // 显示成功消息
-    showSubmitNotice('✓ TopIAM 已代填并提交');
+
+    if (!filler.didFillPassword) {
+      targetLog('严格模式告警：未检测到密码字段被成功填充，尝试按可能成功继续', {
+        strategy,
+        href: window.location.href
+      });
+    }
+
+    if (!filler.didSubmit) {
+      try {
+        const passEl = document.querySelector('input[type="password"], input[name*="pass" i], input[id*="pass" i]');
+        const form = passEl?.form || null;
+        if (form && typeof form.requestSubmit === 'function') {
+          form.requestSubmit();
+          filler.didSubmit = true;
+        } else if (form) {
+          form.submit();
+          filler.didSubmit = true;
+        }
+      } catch (error) {}
+
+      if (!filler.didSubmit) {
+        targetLog('严格模式告警：未检测到有效提交动作，按可能自动登录继续', {
+          strategy,
+          href: window.location.href
+        });
+      }
+    }
+
+    const pageChanged = pageAboutToUnload
+      || window.location.href !== startUrl
+      || window._iframeLoginResultTemp === true
+      || await waitForPageChange(4000);
+
+    let postHasPasswordField = false;
+    let postPasswordValueEmpty = true;
+    let postHasSubmitControl = false;
+    try {
+      const passwordEl = document.querySelector('input[type="password"], input[name*="pass" i], input[id*="pass" i]');
+      postHasPasswordField = Boolean(passwordEl);
+      postPasswordValueEmpty = passwordEl ? !String(passwordEl.value || '').trim() : true;
+      postHasSubmitControl = Boolean(document.querySelector('button[type="submit"], input[type="submit"], button, [role="button"]'));
+    } catch (error) {}
+
+    const stillStrongLoginSurface = postHasPasswordField && postHasSubmitControl;
+    const acceptedByPostSignals = !postHasPasswordField || postPasswordValueEmpty;
+
+    const strongFailureSignal = !pageChanged && stillStrongLoginSurface && !acceptedByPostSignals;
+    if (strongFailureSignal) {
+      targetLog('严格模式告警：提交后仍像登录页，但为避免误判先按成功处理', {
+        strategy,
+        didFillPassword: filler.didFillPassword,
+        didSubmit: filler.didSubmit,
+        postHasPasswordField,
+        postPasswordValueEmpty,
+        postHasSubmitControl,
+        href: window.location.href
+      });
+    }
+
+    let stabilizedLoggedInSurface = false;
+    let stabilizedLoginSurface = hasLikelyLoginSurface();
+    const probeStart = Date.now();
+    const PROBE_WINDOW_MS = 2600;
+    while (Date.now() - probeStart < PROBE_WINDOW_MS) {
+      if (window.location.href !== startUrl || window._iframeLoginResultTemp === true) {
+        stabilizedLoggedInSurface = true;
+        break;
+      }
+
+      const nowLoggedIn = hasLikelyLoggedInSurface();
+      const nowLoginSurface = hasLikelyLoginSurface();
+      if (nowLoggedIn) {
+        stabilizedLoggedInSurface = true;
+        stabilizedLoginSurface = false;
+        break;
+      }
+
+      stabilizedLoginSurface = nowLoginSurface;
+      await new Promise((resolve) => setTimeout(resolve, 260));
+    }
+
+    const loginConfirmed = pageChanged
+      || stabilizedLoggedInSurface
+      || (filler.didSubmit && !stabilizedLoginSurface && acceptedByPostSignals);
+
+    const postLoginPathConfirmed = isLikelyPostLoginPath();
+    const finalLoginConfirmed = loginConfirmed || postLoginPathConfirmed;
+
+    if (!finalLoginConfirmed) {
+      targetLog('登录成功判定未通过：提交后仍缺少明确成功信号', {
+        pageChanged,
+        stabilizedLoggedInSurface,
+        stabilizedLoginSurface,
+        postLoginPathConfirmed,
+        didFillPassword: filler.didFillPassword,
+        didSubmit: filler.didSubmit,
+        postHasPasswordField,
+        postPasswordValueEmpty,
+        postHasSubmitControl,
+        href: window.location.href
+      });
+      return false;
+    }
+
+    targetLog('代填流程已通过严格校验', {
+      pageChanged,
+      loginConfirmed: finalLoginConfirmed,
+      stabilizedLoggedInSurface,
+      stabilizedLoginSurface,
+      postLoginPathConfirmed,
+      strategy,
+      didFillPassword: filler.didFillPassword,
+      didSubmit: filler.didSubmit,
+      postHasPasswordField,
+      postPasswordValueEmpty,
+      postHasSubmitControl
+    });
+    showSubmitNotice('✓ TopIAM 已检测到登录成功');
     return true;
   }
 
@@ -2411,7 +3071,32 @@
           taskId
         });
 
+        if (!isTopIamPlatformPage()) {
+          ensureUserWatermark(auth.fullName || auth.username);
+          targetLog('已在代填开始阶段注入用户水印', {
+            username: auth.username,
+            fullName: auth.fullName,
+            taskId
+          });
+        }
+
         applyForceRefreshRules(auth.extra || {});
+
+        const skipAutofill = await shouldSkipAutofillAsAlreadyLoggedIn({ hasTask: Boolean(taskId) });
+        if (skipAutofill) {
+          targetLog('检测到应用已处于登录态，跳过自动代填', {
+            href: window.location.href,
+            username: auth.username
+          });
+          if (taskId) {
+            showSubmitNotice('✓ TopIAM 代填流程已完成登录');
+            await startSessionAfterLogin(taskId, auth.username, 'task_flow_logged_in');
+          } else {
+            showSubmitNotice('✓ 检测到应用已登录，跳过自动代填');
+            await startSessionAfterLogin(taskId, auth.username, 'already_logged_in_skip');
+          }
+          return;
+        }
 
         if (shouldForceRefreshCurrentPath()) {
           const resetTriggeredByRule = await forceResetAppStateAndRetry(taskId, 'force_refresh_path_rule');
@@ -2428,22 +3113,14 @@
           }
         }
 
-        const skipAutofill = await shouldSkipAutofillAsAlreadyLoggedIn();
-        if (skipAutofill) {
-          targetLog('检测到应用已处于登录态，跳过自动代填', {
-            href: window.location.href,
-            username: auth.username
-          });
-          showSubmitNotice('✓ 检测到应用已登录，跳过自动代填');
-          await startSessionAfterLogin(taskId, auth.username, 'already_logged_in_skip');
-          return;
-        }
-
         const loginSuccess = await runFill(auth);
         
         if (loginSuccess) {
           targetLog('✓ 代填和登录验证全流程完成，用户已成功登录');
           await startSessionAfterLogin(taskId, auth.username, 'autofill_success');
+          if (!isTopIamPlatformPage()) {
+            ensureUserWatermark(auth.fullName || auth.username);
+          }
         } else {
           targetLog('代填流程完成但登录验证未通过，可能需要额外操作');
         }
@@ -2460,6 +3137,21 @@
           if (resetTriggered) {
             return;
           }
+        }
+
+        if (hasLikelyLoggedInSurface()) {
+          targetLog('捕获异常但页面呈现已登录特征，按成功处理', {
+            error: errorMessage,
+            href: window.location.href
+          });
+          if (taskId) {
+            showSubmitNotice('✓ TopIAM 代填流程已完成登录');
+            await startSessionAfterLogin(taskId, auth?.username || '', 'task_flow_error_but_logged_in');
+          } else {
+            showSubmitNotice('✓ 检测到应用已登录，跳过失败提示');
+            await startSessionAfterLogin(taskId, auth?.username || '', 'error_but_logged_in');
+          }
+          return;
         }
 
         showSubmitNotice('❌ 自动登录失败，请手动操作');
@@ -2563,12 +3255,13 @@
       const loginSuccess = await runFill({
         username: data.username || '',
         password: data.password || '',
-        extra: data.extra || {}
+        extra: data.extra || {},
+        fullName: data.fullName || data.username || ''
       });
       
       window.removeEventListener('beforeunload', handleIframeUnload);
       
-      targetLog('iframe代填完成，发送回执', { loginSuccess });
+      targetLog('iframe代填完成，发送回执', { loginSuccess, fullName: String(data.fullName || '') });
       sendIframeAckToParent(loginSuccess, loginSuccess ? 'page_changed' : 'page_not_changed');
       
     } catch (error) {
@@ -2586,7 +3279,6 @@
   async function bootstrap() {
     // 页面加载时检查是否有待显示的登录消息
     displayPendingMessage();
-    startSsoStateSync();
     
     targetLog('=== TopIAM扩展已激活 ===', {
       isTopWindow: IS_TOP_WINDOW,
@@ -2631,6 +3323,10 @@
         targetLog('通过标签页兜底恢复代填任务（后台恢复）', { taskId, isTop: IS_TOP_WINDOW });
       }
     }
+
+    loadWatermarkWhitelist();
+    watchWatermarkWhitelist();
+    startSsoStateSync();
 
     // 【改进】使用isLikelyLoginContext()判断
     const isLoginPage = isLikelyLoginContext();

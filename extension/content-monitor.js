@@ -7,8 +7,10 @@
   const API_EVENT = '__TOPIAM_APP_LIST_RESPONSE__';
   const FORM_POST_EVENT = '__TOPIAM_FORM_POST_CAPTURED__';
   const FORM_POST_DECISION_EVENT = '__TOPIAM_FORM_POST_DECISION__';
+  const BLOCK_CREDENTIAL_EVENT = '__TOPIAM_BLOCK_CREDENTIAL_STORE__';
   const DEBUG_EVENT = '__TOPIAM_DEBUG_EVENT__';
   const DEBUG_PANEL_STORAGE_KEY = 'debugPanelEnabled';
+  const TOPIAM_DOMAINS_STORAGE_KEY = 'topiamDomains';
 
   const debugState = {
     enabled: false,
@@ -29,6 +31,195 @@
   let topiamLogoutClickPendingAt = 0;
   let topiamAuthProbeInFlight = false;
   let topiamAuthLastReport = { authenticated: null, at: 0 };
+  let knownTopIamDomains = new Set();
+  let appListFetchInFlight = false;
+  let appListLastFetchAt = 0;
+  const APP_LIST_FETCH_COOLDOWN_MS = 8000;
+  let appListBridgeSeen = false;
+  let appListFallbackScheduled = false;
+  const APP_LIST_FALLBACK_DELAY_MS = 12000;
+
+  // 心跳探测状态：最多 2 次，之后进入纯 Cookie 监测模式
+  let topiamHeartbeatAttempts = 0;
+  const TOPIAM_HEARTBEAT_MAX_ATTEMPTS = 2;
+  let topiamCookieOnlyModeActive = false;
+  let topiamHeartbeatSuccessCount = 0;
+
+  function runDeferredTask(task, reason = 'deferred', minDelayMs = 0) {
+    const run = () => {
+      Promise.resolve()
+        .then(() => task())
+        .catch(() => {});
+    };
+
+    const scheduleIdle = () => {
+      if (typeof window.requestIdleCallback === 'function') {
+        window.requestIdleCallback(() => run(), { timeout: 1800 });
+        return;
+      }
+      setTimeout(run, 0);
+    };
+
+    if (minDelayMs > 0) {
+      setTimeout(scheduleIdle, minDelayMs);
+      return;
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', scheduleIdle, { once: true });
+      return;
+    }
+
+    scheduleIdle();
+  }
+
+  function scheduleTopIamDetect(reason = 'queued', minDelayMs = 0) {
+    runDeferredTask(() => detectTopIAM(), `detect_${reason}`, minDelayMs);
+  }
+
+  function scheduleAppListFallbackFetch(reason = 'unknown') {
+    if (appListFallbackScheduled) return;
+    appListFallbackScheduled = true;
+
+    setTimeout(() => {
+      appListFallbackScheduled = false;
+      if (!isDetectedTopIamPlatform) return;
+      if (appListBridgeSeen) {
+        monitorLog('跳过 app/list 主动兜底：已收到 bridge 响应', { reason });
+        return;
+      }
+      fetchTopIamAppList(`fallback_${reason}`).catch(() => {});
+    }, APP_LIST_FALLBACK_DELAY_MS);
+  }
+
+  function normalizeDomainLike(domainLike) {
+    const raw = String(domainLike || '').trim().toLowerCase();
+    if (!raw) return '';
+
+    try {
+      if (/^https?:\/\//.test(raw)) {
+        return String(new URL(raw).hostname || '').toLowerCase();
+      }
+      return String(new URL(`https://${raw}`).hostname || '').toLowerCase();
+    } catch (error) {
+      return raw.replace(/^\.+/, '');
+    }
+  }
+
+  function isKnownTopIamDomain(hostnameLike) {
+    const host = normalizeDomainLike(hostnameLike);
+    if (!host) return false;
+
+    for (const domain of knownTopIamDomains) {
+      if (!domain) continue;
+      if (host === domain || host.endsWith(`.${domain}`)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function hasTopIamSurfaceMarker() {
+    const host = String(location.hostname || '').toLowerCase();
+    const path = String(location.pathname || '').toLowerCase();
+    const href = String(location.href || '').toLowerCase();
+    const title = String(document.title || '').toLowerCase();
+
+    if (/topiam/.test(host) || /topiam/.test(path) || /topiam/.test(href) || /topiam/.test(title)) {
+      return true;
+    }
+
+    if (/^\/portal\/app(?:\/|$)/.test(path)
+      || /\/api\/v1\/authorize\/form\//.test(path)
+      || /\/api\/v1\/user\/app\/initiator\//.test(path)) {
+      return true;
+    }
+
+    return Boolean(document.querySelector(
+      '[class*="topiam" i], script[src*="topiam" i], link[href*="topiam" i], meta[name*="topiam" i]'
+    ));
+  }
+
+  function isTopIamControlPath(pathLike) {
+    const path = String(pathLike || '').toLowerCase();
+    if (!path) return false;
+
+    return /^\/portal\/app(?:\/|$)/.test(path)
+      || /^\/login(?:\/|$)/.test(path)
+      || /^\/signin(?:\/|$)/.test(path)
+      || /^\/oauth(?:\/|$)/.test(path)
+      || /^\/cas(?:\/|$)/.test(path)
+      || /^\/auth\/login(?:\/|$)/.test(path)
+      || /\/api\/v1\/authorize\/form\//.test(path)
+      || /\/api\/v1\/user\/app\/initiator\//.test(path)
+      || /\/authorize\/form\//.test(path)
+      || /\/initiator(?:\/|$)/.test(path);
+  }
+
+  function shouldAttemptTopIamProbe(source = 'unknown') {
+    if (isDetectedTopIamPlatform) return true;
+
+    const protocol = String(location.protocol || '').toLowerCase();
+    if (protocol !== 'http:' && protocol !== 'https:') return false;
+
+    const path = String(location.pathname || '').toLowerCase();
+    if (!isTopIamControlPath(path)) {
+      monitorLog('跳过TopIAM探测：当前路径非TopIAM控制路径', {
+        source,
+        host: location.hostname,
+        path
+      });
+      return false;
+    }
+
+    // /portal/app 页面直接允许探测（即使没有表面标记）
+    const isPortalPage = /^\/portal\/app(?:\/|$)/.test(path);
+    if (isPortalPage) {
+      return true;
+    }
+
+    const bySurface = hasTopIamSurfaceMarker();
+    if (!bySurface) {
+      monitorLog('跳过TopIAM探测：当前页面无TopIAM特征', {
+        source,
+        host: location.hostname,
+        path
+      });
+    }
+    return bySurface;
+  }
+
+  function loadKnownTopIamDomains() {
+    chrome.storage.local.get([TOPIAM_DOMAINS_STORAGE_KEY], (result) => {
+      const list = Array.isArray(result?.[TOPIAM_DOMAINS_STORAGE_KEY])
+        ? result[TOPIAM_DOMAINS_STORAGE_KEY]
+        : [];
+      const normalized = list.map(normalizeDomainLike).filter(Boolean);
+      knownTopIamDomains = new Set(normalized);
+      monitorLog('已加载TopIAM域名白名单', {
+        count: knownTopIamDomains.size
+      });
+    });
+  }
+
+  function watchKnownTopIamDomains() {
+    if (window.__topiamDomainWatchBound) return;
+    window.__topiamDomainWatchBound = true;
+
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName !== 'local') return;
+      if (!Object.prototype.hasOwnProperty.call(changes, TOPIAM_DOMAINS_STORAGE_KEY)) return;
+
+      const next = Array.isArray(changes[TOPIAM_DOMAINS_STORAGE_KEY]?.newValue)
+        ? changes[TOPIAM_DOMAINS_STORAGE_KEY].newValue
+        : [];
+      const normalized = next.map(normalizeDomainLike).filter(Boolean);
+      knownTopIamDomains = new Set(normalized);
+      monitorLog('TopIAM域名白名单已更新', {
+        count: knownTopIamDomains.size
+      });
+    });
+  }
 
   monitorLog('content script 已加载', {
     href: location.href,
@@ -129,7 +320,21 @@
     return `${location.protocol}//${location.host}/api/v1/session/current_user?_topiam_probe=1`;
   }
 
+  function getHeartbeatEndpoint() {
+    return `${location.protocol}//${location.host}/api/v1/user/app/group_list?_topiam_probe=1&_topiam_heartbeat=1`;
+  }
+
   async function fetchTopIamCurrentUser() {
+    if (!shouldAttemptTopIamProbe('fetch_current_user')) {
+      return { platformDetected: false, authenticated: false, username: '', fullName: '', source: 'probe_guard_skipped' };
+    }
+
+    // /portal/app 页面即使没有表面标记也允许继续探测
+    const isPortalPage = /^\/portal\/app(?:\/|$)/.test(String(location.pathname || '').toLowerCase());
+    if (!isDetectedTopIamPlatform && !hasTopIamSurfaceMarker() && !isPortalPage) {
+      return { platformDetected: false, authenticated: false, username: '', fullName: '', source: 'probe_guard_no_dom_marker' };
+    }
+
     let timeoutId = null;
     try {
       const endpoint = getCurrentUserEndpoint();
@@ -185,6 +390,66 @@
       return { platformDetected: true, authenticated: true, username, fullName, source: 'api_current_user' };
     } catch (error) {
       return { platformDetected: false, authenticated: false, username: '', fullName: '', source: `api_error_${error?.message || 'unknown'}` };
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
+  }
+
+  async function fetchTopIamHeartbeatState() {
+    if (!shouldAttemptTopIamProbe('fetch_group_list_heartbeat')) {
+      return { platformDetected: false, authenticated: false, source: 'probe_guard_skipped' };
+    }
+
+    // /portal/app 页面即使没有表面标记也允许继续探测
+    const isPortalPage = /^\/portal\/app(?:\/|$)/.test(String(location.pathname || '').toLowerCase());
+    if (!isDetectedTopIamPlatform && !hasTopIamSurfaceMarker() && !isPortalPage) {
+      return { platformDetected: false, authenticated: false, source: 'probe_guard_no_dom_marker' };
+    }
+
+    let timeoutId = null;
+    try {
+      const endpoint = getHeartbeatEndpoint();
+      const controller = new AbortController();
+      timeoutId = setTimeout(() => controller.abort(), 3500);
+
+      const resp = await fetch(endpoint, {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+        redirect: 'follow',
+        signal: controller.signal
+      });
+
+      const redirectedToLogin = (() => {
+        if (!resp.redirected) return false;
+        try {
+          const final = new URL(String(resp.url || ''), location.href);
+          const finalPath = String(final.pathname || '').toLowerCase();
+          if (/\/authorize\/form\//.test(finalPath) || /\/initiator\//.test(finalPath)) return false;
+          return /^\/login(?:\/|$)/.test(finalPath)
+            || /^\/signin(?:\/|$)/.test(finalPath)
+            || /^\/oauth(?:\/|$)/.test(finalPath)
+            || /^\/cas(?:\/|$)/.test(finalPath)
+            || /^\/auth\/login(?:\/|$)/.test(finalPath);
+        } catch {
+          return false;
+        }
+      })();
+      if (resp.status === 401 || resp.status === 403 || redirectedToLogin) {
+        return { platformDetected: true, authenticated: false, source: `http_${resp.status}` };
+      }
+
+      const payload = await resp.clone().json().catch(() => null);
+      if (isUnauthorizedPayload(payload)) {
+        return { platformDetected: true, authenticated: false, source: 'api_unauthorized_payload' };
+      }
+      if (!isCurrentUserApiSuccess(payload)) {
+        return { platformDetected: false, authenticated: false, source: 'api_unsuccessful' };
+      }
+
+      return { platformDetected: true, authenticated: true, source: 'api_group_list' };
+    } catch (error) {
+      return { platformDetected: false, authenticated: false, source: `api_error_${error?.message || 'unknown'}` };
     } finally {
       if (timeoutId) clearTimeout(timeoutId);
     }
@@ -542,23 +807,81 @@
     return /401|403|unauth|login|expired|token/.test(code) || /未登录|登录过期|请登录|unauth|expired|token/.test(message);
   }
 
+  async function queryTopIamCookieStability(reason = 'unknown') {
+    try {
+      const response = await chrome.runtime.sendMessage({
+        action: 'checkTopIamCookieStability',
+        reason
+      });
+
+      return {
+        success: Boolean(response?.success),
+        stable: Boolean(response?.stable),
+        reason: String(response?.reason || ''),
+        authenticated: Boolean(response?.authenticated),
+        fingerprintSet: Boolean(response?.fingerprintSet),
+        hasCurrentCookie: Boolean(response?.hasCurrentCookie)
+      };
+    } catch (error) {
+      return {
+        success: false,
+        stable: false,
+        reason: 'message_error',
+        authenticated: false,
+        fingerprintSet: false,
+        hasCurrentCookie: false
+      };
+    }
+  }
+
   async function probeTopIamSession(reason = 'interval') {
     if (topiamAuthProbeInFlight) return;
     if (document.visibilityState === 'hidden' && reason === 'interval') return;
 
+    // 如果已进入纯 Cookie 监测模式，则跳过所有心跳探测（只依靠 Cookie 变化事件）
+    if (topiamCookieOnlyModeActive) {
+      monitorLog('已进入纯 Cookie 监测模式，跳过心跳探测', {
+        reason,
+        heartbeatAttempts: topiamHeartbeatAttempts,
+        successCount: topiamHeartbeatSuccessCount
+      });
+      return;
+    }
+
     topiamAuthProbeInFlight = true;
     try {
-      const apiUser = await fetchTopIamCurrentUser();
-      const username = apiUser.authenticated ? apiUser.username : detectTopIamUserNameFromPage();
-      const fullName = apiUser.authenticated ? apiUser.fullName : '';
+      const heartbeat = await fetchTopIamHeartbeatState();
+      const username = detectTopIamUserNameFromPage();
+      const fullName = '';
       if (isTopIamLoginPage()) {
         reportTopIamAuthState(false, '', `${reason}_login_page`);
         return;
       }
 
-      if (!apiUser.authenticated) {
-        reportTopIamAuthState(false, '', `${reason}_${apiUser.source}`);
+      if (!heartbeat.authenticated) {
+        reportTopIamAuthState(false, '', `${reason}_${heartbeat.source}`);
+        // 心跳失败，重置状态，下次重新计数
+        topiamHeartbeatAttempts = 0;
+        topiamHeartbeatSuccessCount = 0;
+        topiamCookieOnlyModeActive = false;
         return;
+      }
+
+      // 心跳成功
+      const cookieStability = await queryTopIamCookieStability(reason);
+      if (!cookieStability.stable) {
+        monitorLog('心跳成功但Cookie未稳定，不进入纯Cookie模式', {
+          reason,
+          cookieReason: cookieStability.reason,
+          fingerprintSet: cookieStability.fingerprintSet,
+          hasCurrentCookie: cookieStability.hasCurrentCookie
+        });
+        topiamHeartbeatAttempts = 0;
+        topiamHeartbeatSuccessCount = 0;
+        topiamCookieOnlyModeActive = false;
+      } else {
+        topiamHeartbeatAttempts += 1;
+        topiamHeartbeatSuccessCount += 1;
       }
 
       const currentUser = username || detectTopIamUserNameFromPage();
@@ -577,9 +900,25 @@
           }
         });
       }
+
+      // 需要“心跳成功 + Cookie未变化”累计达到阈值，才进入纯 Cookie 监测模式
+      if (cookieStability.stable && topiamHeartbeatSuccessCount >= TOPIAM_HEARTBEAT_MAX_ATTEMPTS) {
+        topiamCookieOnlyModeActive = true;
+        monitorLog(`✓ 心跳探测成功 ${TOPIAM_HEARTBEAT_MAX_ATTEMPTS} 次，进入纯 Cookie 监测模式`, {
+          reason,
+          heartbeatAttempts: topiamHeartbeatAttempts,
+          successCount: topiamHeartbeatSuccessCount,
+          cookieReason: cookieStability.reason
+        });
+      }
+
       reportTopIamAuthState(true, currentUser, `${reason}_ok`);
     } catch (error) {
       monitorLog('TopIAM会话探针异常', { reason, error: error?.message || 'unknown' });
+      // 异常时也重置计数
+      topiamHeartbeatAttempts = 0;
+      topiamHeartbeatSuccessCount = 0;
+      topiamCookieOnlyModeActive = false;
     } finally {
       topiamAuthProbeInFlight = false;
     }
@@ -686,23 +1025,37 @@
 
   async function detectTopIAM() {
     if (isDetectedTopIamPlatform || topiamDetectInFlight) return;
+    if (!shouldAttemptTopIamProbe('detect_topiam')) return;
+
     topiamDetectInFlight = true;
     topiamDetectAttempts += 1;
     try {
       const apiProbe = await fetchTopIamCurrentUser();
+      const canUsePortalFallback = isPortalAppPage() && (hasTopIamSurfaceMarker() || isKnownTopIamDomain(location.hostname));
       if (!apiProbe.platformDetected) {
-        monitorLog('TopIAM平台探测未命中，等待重试', {
+        if (canUsePortalFallback) {
+          monitorLog('TopIAM平台探测走 portal 兜底识别（API未确认）', {
+            attempt: topiamDetectAttempts,
+            host: location.hostname,
+            path: location.pathname,
+            source: apiProbe.source
+          });
+        } else {
+        monitorLog('TopIAM平台探测未命中（API未确认）', {
           attempt: topiamDetectAttempts,
           source: apiProbe.source,
           href: location.href
         });
         return;
+        }
       }
+
       isDetectedTopIamPlatform = true;
 
       const domain = window.location.hostname;
+      const detectSource = apiProbe.platformDetected ? (apiProbe.source || 'api_current_user') : 'portal_fallback';
 
-      monitorLog('检测到TopIAM平台（host探测）', { domain, href: location.href, source: apiProbe.source });
+      monitorLog('检测到TopIAM平台（DOM优先探测）', { domain, href: location.href, source: detectSource });
 
       chrome.runtime.sendMessage({
         action: 'registerTopiamDomain',
@@ -725,21 +1078,16 @@
         });
       }
 
-      syncTopIamIdentity('detect');
-      setTimeout(() => syncTopIamIdentity('delayed_1s'), 1000);
-      setTimeout(() => syncTopIamIdentity('delayed_3s'), 3000);
+      runDeferredTask(() => syncTopIamIdentity('detect_async'), 'sync_identity', 300);
       monitorTopIamLogout();
-      startTopIamSessionProbe();
+      runDeferredTask(() => startTopIamSessionProbe(), 'start_session_probe', 1200);
 
       installApiBridge();
       bindApiEvent();
-      fetchTopIamAppList('detect').catch(() => {});
-      setTimeout(() => fetchTopIamAppList('detect_delayed_1s').catch(() => {}), 1000);
-      setTimeout(() => fetchTopIamAppList('detect_delayed_3s').catch(() => {}), 3000);
+      scheduleAppListFallbackFetch('detect');
       bindFormPostEvent();
       onTopIamPortalPathReady('detect');
-      setTimeout(() => onTopIamPortalPathReady('detect_delayed_1s'), 1000);
-      setTimeout(() => onTopIamPortalPathReady('detect_delayed_3s'), 3000);
+      runDeferredTask(() => onTopIamPortalPathReady('detect_deferred'), 'portal_ready', 1200);
       monitorFormSubmission();
     } finally {
       topiamDetectInFlight = false;
@@ -747,24 +1095,24 @@
   }
 
   function scheduleTopIamDetectionRetries() {
-    const delays = [0, 600, 1500, 3000, 6000, 12000];
+    const delays = [1200, 3500, 8000];
     delays.forEach((delay) => {
       setTimeout(() => {
         if (!isDetectedTopIamPlatform) {
-          detectTopIAM().catch(() => {});
+          scheduleTopIamDetect(`retry_${delay}`, 0);
         }
       }, delay);
     });
 
     window.addEventListener('focus', () => {
       if (!isDetectedTopIamPlatform) {
-        detectTopIAM().catch(() => {});
+        scheduleTopIamDetect('focus', 0);
       }
     });
 
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible' && !isDetectedTopIamPlatform) {
-        detectTopIAM().catch(() => {});
+        scheduleTopIamDetect('visible', 0);
       }
     });
   }
@@ -778,6 +1126,7 @@
     script.dataset.topiamEvent = API_EVENT;
     script.dataset.topiamFormEvent = FORM_POST_EVENT;
     script.dataset.topiamDecisionEvent = FORM_POST_DECISION_EVENT;
+    script.dataset.topiamBlockCredentialEvent = BLOCK_CREDENTIAL_EVENT;
     script.dataset.topiamDebugEvent = DEBUG_EVENT;
     const container = document.documentElement || document.head || document.body;
     if (container) {
@@ -810,6 +1159,7 @@
     window.addEventListener(API_EVENT, (event) => {
       const detail = event?.detail || {};
       const apps = normalizeAppList(detail.body);
+      appListBridgeSeen = true;
       monitorLog('收到 app/list 响应', { url: detail.url, count: apps.length });
       processAppList(apps, 'bridge_event');
     });
@@ -817,6 +1167,20 @@
 
   async function fetchTopIamAppList(reason = 'unknown') {
     if (!isDetectedTopIamPlatform) return;
+
+    const now = Date.now();
+    if (appListFetchInFlight) return;
+    if (now - appListLastFetchAt < APP_LIST_FETCH_COOLDOWN_MS) {
+      monitorLog('跳过重复 app/list 拉取（冷却中）', {
+        reason,
+        cooldownMs: APP_LIST_FETCH_COOLDOWN_MS
+      });
+      return;
+    }
+
+    appListFetchInFlight = true;
+    appListLastFetchAt = now;
+
     const pageSize = 20;
     const seen = new Set();
     const mergedApps = [];
@@ -873,6 +1237,8 @@
         reason,
         error: error?.message || String(error)
       });
+    } finally {
+      appListFetchInFlight = false;
     }
   }
 
@@ -889,6 +1255,8 @@
       }
     });
 
+    const withRealTargetCount = formApps.filter((app) => Boolean(String(app?.realTargetUrl || '').trim())).length;
+
     if (formApps.length > 0) {
       chrome.runtime.sendMessage({
         action: 'registerDiscoveredApps',
@@ -903,7 +1271,8 @@
     monitorLog('处理应用列表完成', {
       source,
       total: apps.length,
-      registeredFormApps: formApps.length
+      registeredFormApps: formApps.length,
+      withRealTargetUrl: withRealTargetCount
     });
   }
 
@@ -958,8 +1327,24 @@
     window.__topiamBgDebugBound = true;
 
     chrome.runtime.onMessage.addListener((request) => {
-      if (request?.action !== 'topiamDebug') return;
-      monitorLog(`BG: ${request.message || 'debug'}`, request.payload || {});
+      if (request?.action === 'topiamDebug') {
+        monitorLog(`BG: ${request.message || 'debug'}`, request.payload || {});
+        return;
+      }
+
+      if (request?.action === 'resetHeartbeatProbe') {
+        // Cookie 值改变，重置心跳状态，重新执行探测
+        topiamHeartbeatAttempts = 0;
+        topiamHeartbeatSuccessCount = 0;
+        topiamCookieOnlyModeActive = false;
+        monitorLog('✓ 收到后台重置信号，已重置心跳探测状态', {
+          reason: request.reason || 'unknown'
+        });
+        
+        // 立即执行一次心跳探测
+        scheduleTopIamDetect('reset_by_background', 0);
+        return;
+      }
     });
   }
 
@@ -1035,9 +1420,16 @@
     if (protocol !== 'form') return null;
 
     const initLoginUrl = String(item.initLoginUrl || item.init_login_url || item.idpInitUrl || '').trim();
-
-    const targetUrl = '';
-    const targetOrigin = '';
+    const realTargetUrl = resolveRealTargetUrlFromApiItem(item, initLoginUrl);
+    const targetUrl = realTargetUrl;
+    const targetOrigin = (() => {
+      if (!realTargetUrl) return '';
+      try {
+        return new URL(realTargetUrl).origin;
+      } catch (error) {
+        return '';
+      }
+    })();
 
     const appId = String(item.appId || item.id || item.clientId || '').trim();
     const appCode = String(item.code || item.appCode || '').trim();
@@ -1054,9 +1446,112 @@
       protocol,
       targetUrl,
       targetOrigin,
-      realTargetUrl: '',
+      realTargetUrl,
       isFormFillLike: true
     };
+  }
+
+  function tryNormalizeHttpUrl(urlLike, baseUrl = location.origin) {
+    const raw = String(urlLike || '').trim();
+    if (!raw) return '';
+    try {
+      const parsed = new URL(raw, baseUrl);
+      const protocol = String(parsed.protocol || '').toLowerCase();
+      if (protocol !== 'http:' && protocol !== 'https:') return '';
+      return parsed.href;
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function isTopIamRelayLikeTarget(urlLike) {
+    const normalized = tryNormalizeHttpUrl(urlLike);
+    if (!normalized) return false;
+    try {
+      const parsed = new URL(normalized);
+      const path = String(parsed.pathname || '').toLowerCase();
+      return /\/api\/v1\/authorize\/form\//.test(path)
+        || /\/api\/v1\/user\/app\/initiator\//.test(path)
+        || /\/authorize\/form\//.test(path)
+        || /\/initiator(?:\/|$)/.test(path)
+        || /\/form-fill(?:\/|$)/.test(path)
+        || /\/auto-login(?:\/|$)/.test(path)
+        || /^\/portal\/app(?:\/|$)/.test(path);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function parseRealTargetFromInitLoginUrl(initLoginUrl) {
+    const normalized = tryNormalizeHttpUrl(initLoginUrl);
+    if (!normalized) return '';
+
+    try {
+      const parsed = new URL(normalized);
+      const candidateKeys = ['target', 'redirect', 'url', 'target_uri', 'target_link_url', 'targetUrl', 'redirectUrl'];
+
+      for (const key of candidateKeys) {
+        const value = String(parsed.searchParams.get(key) || '').trim();
+        if (!value) continue;
+
+        const direct = tryNormalizeHttpUrl(value, parsed.href);
+        if (direct && !isTopIamRelayLikeTarget(direct)) {
+          return direct;
+        }
+
+        try {
+          const decoded = decodeURIComponent(value);
+          const decodedNormalized = tryNormalizeHttpUrl(decoded, parsed.href);
+          if (decodedNormalized && !isTopIamRelayLikeTarget(decodedNormalized)) {
+            return decodedNormalized;
+          }
+        } catch (error) {}
+      }
+    } catch (error) {}
+
+    return '';
+  }
+
+  function readCandidateTargetFromObject(obj) {
+    if (!obj || typeof obj !== 'object') return '';
+    const keys = [
+      'realTargetUrl', 'real_target_url',
+      'targetUrl', 'target_url',
+      'redirectUrl', 'redirect_url',
+      'targetLinkUrl', 'target_link_url',
+      'url', 'linkUrl', 'link_url',
+      'destinationUrl', 'destination_url',
+      'launchUrl', 'launch_url'
+    ];
+
+    for (const key of keys) {
+      const value = obj[key];
+      if (typeof value !== 'string') continue;
+      const normalized = tryNormalizeHttpUrl(value);
+      if (normalized && !isTopIamRelayLikeTarget(normalized)) {
+        return normalized;
+      }
+    }
+    return '';
+  }
+
+  function resolveRealTargetUrlFromApiItem(item, initLoginUrl) {
+    const containers = [
+      item,
+      item?.extra,
+      item?.config,
+      item?.settings,
+      item?.metadata,
+      item?.appConfig,
+      item?.appSetting
+    ];
+
+    for (const container of containers) {
+      const hit = readCandidateTargetFromObject(container);
+      if (hit) return hit;
+    }
+
+    return parseRealTargetFromInitLoginUrl(initLoginUrl);
   }
 
   function getAppProtocol(item) {
@@ -1122,6 +1617,15 @@
 
       const launch = resolveLaunchFromClickedElement(candidate);
       if (launch?.initLoginUrl && launch?.protocol === 'form') {
+        if (!shouldUseBackgroundPrefetch(launch.initLoginUrl)) {
+          monitorLog('跳过后台预取：initLoginUrl 非TopIAM中转链路，放行原生跳转', {
+            initLoginUrl: launch.initLoginUrl,
+            appId: launch.appId || '',
+            appName: launch.appName || ''
+          });
+          return;
+        }
+
         e.preventDefault();
         e.stopImmediatePropagation();
         monitorLog('已硬拦截应用点击，改为后台预取并接管', launch);
@@ -1132,6 +1636,13 @@
 
       const fallbackInitLoginUrl = resolveInitLoginUrlFromElement(candidate);
       if (fallbackInitLoginUrl) {
+        if (!shouldUseBackgroundPrefetch(fallbackInitLoginUrl)) {
+          monitorLog('跳过后台预取：兜底URL非TopIAM中转链路，放行原生跳转', {
+            initLoginUrl: fallbackInitLoginUrl
+          });
+          return;
+        }
+
         e.preventDefault();
         e.stopImmediatePropagation();
         monitorLog('命中兜底 initLoginUrl，改为后台预取并接管', {
@@ -1221,6 +1732,37 @@
       }
     }
     return null;
+  }
+
+  function shouldUseBackgroundPrefetch(initLoginUrl) {
+    if (!initLoginUrl) return false;
+
+    try {
+      const parsed = new URL(initLoginUrl, location.origin);
+      const path = String(parsed.pathname || '').toLowerCase();
+
+      const isTopIamRelayPath = /\/api\/v1\/authorize\/form\/[^/]+\/initiator/.test(path)
+        || /\/api\/v1\/user\/app\/initiator\//.test(path)
+        || /\/authorize\/form\//.test(path)
+        || /\/initiator(?:\/|$)/.test(path)
+        || /\/form-fill(?:\/|$)/.test(path)
+        || /\/auto-login(?:\/|$)/.test(path);
+
+      if (!isTopIamRelayPath) {
+        return false;
+      }
+
+      const currentHost = String(location.hostname || '').toLowerCase();
+      const targetHost = String(parsed.hostname || '').toLowerCase();
+      const sameOrigin = parsed.origin === location.origin;
+      const sameTopLevelHost = targetHost === currentHost
+        || targetHost.endsWith(`.${currentHost}`)
+        || currentHost.endsWith(`.${targetHost}`);
+
+      return sameOrigin || sameTopLevelHost;
+    } catch (error) {
+      return false;
+    }
   }
 
   function prefetchInitAndLaunch(launch) {
@@ -1584,17 +2126,26 @@
   }
 
   function bootstrapEarly() {
+    if (shouldAttemptTopIamProbe('early_bridge_bootstrap') || isPortalAppPage()) {
+      installApiBridge();
+      bindApiEvent();
+    }
+
     bindBridgeDebugEvent();
     bindBackgroundDebugEvent();
     watchPortalPathChanges();
     watchDebugPanelPreferenceChange();
+    watchKnownTopIamDomains();
     loadDebugPanelPreference();
+    loadKnownTopIamDomains();
     scheduleTopIamDetectionRetries();
-    detectTopIAM().then(() => {
-      if (debugState.enabled) {
-        ensureDebugPanel();
-      }
-    }).catch(() => {});
+    
+    // /portal/app 页面立即进行检测（不延迟）
+    if (isPortalAppPage()) {
+      runDeferredTask(() => detectTopIAM(), 'detect_bootstrap_portal', 0);
+    } else {
+      scheduleTopIamDetect('bootstrap', 0);
+    }
   }
 
   bootstrapEarly();
