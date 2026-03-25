@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TopIAM Universal Form Interceptor",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "全自动拦截TopIAM表单代填，接管复杂应用登录",
   "permissions": [
     "storage",
