@@ -24,6 +24,10 @@
   let forceRefreshPathRules = [];
   let watermarkWhitelistUrlMap = new Map();
   let watermarkWhitelistHostMap = new Map();
+  let activeLoginEntryOverride = {
+    normalizedUrl: '',
+    expiresAt: 0
+  };
 
   function targetLog(message, payload) {
     if (typeof payload === 'undefined') {
@@ -1024,10 +1028,6 @@
 
       let userEl = bestPair.userEl;
       let passEl = bestPair.passEl;
-
-      if (!passEl && visibleInputs.length) {
-        passEl = visibleInputs[visibleInputs.length - 1] || null;
-      }
 
       if (!userEl && passEl) {
         const siblings = visibleInputs.filter((node) => node !== passEl && getContainer(node) === getContainer(passEl));
@@ -2373,19 +2373,7 @@
   }
 
   function blockDirectLogin(reason = 'sso_required') {
-    const blocker = (event) => {
-      const target = event.target;
-      const isFormSubmit = target instanceof HTMLFormElement;
-      const isLoginButton = target instanceof HTMLElement && target.matches('button[type="submit"], input[type="submit"], .login-btn, [class*="login"]');
-      if (!isFormSubmit && !isLoginButton) return;
-
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      showAccessDeniedNotice(reason);
-    };
-
-    document.addEventListener('submit', blocker, true);
-    document.addEventListener('click', blocker, true);
+    // 直访场景仅提示，不拦截用户行为，用户可自行选择是否经由SSO访问。
     showAccessDeniedNotice(reason);
   }
 
@@ -2401,9 +2389,23 @@
   }
 
   function showSsoRequiredNotice(message = null) {
-    if (document.getElementById('topiam-sso-required')) return;
-
+    const existing = document.getElementById('topiam-sso-required');
     const defaultMessage = message || '此应用受SSO保护，请返回TopIAM重新点击应用入口进行登录。';
+
+    if (existing) {
+      const messageEl = existing.querySelector('.topiam-sso-required-message');
+      if (messageEl) {
+        messageEl.textContent = defaultMessage;
+      }
+      clearTimeout(Number(existing.dataset.dismissTimer || 0));
+      const timer = window.setTimeout(() => {
+        try {
+          existing.remove();
+        } catch (e) {}
+      }, 5000);
+      existing.dataset.dismissTimer = String(timer);
+      return;
+    }
     
     const div = document.createElement('div');
     div.id = 'topiam-sso-required';
@@ -2423,8 +2425,26 @@
       max-width: 320px;
       line-height: 1.5;
     `;
-    div.textContent = defaultMessage;
+    div.innerHTML = `
+      <div class="topiam-sso-required-message" style="margin-bottom:8px;">${defaultMessage}</div>
+      <button type="button" style="border:none;background:transparent;color:#8c8c8c;cursor:pointer;padding:0;font-size:12px;">我知道了</button>
+    `;
+    const closeBtn = div.querySelector('button');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', () => {
+        try {
+          div.remove();
+        } catch (e) {}
+      });
+    }
     document.body.appendChild(div);
+
+    const timer = window.setTimeout(() => {
+      try {
+        div.remove();
+      } catch (e) {}
+    }, 5000);
+    div.dataset.dismissTimer = String(timer);
   }
 
   function hasLikelyLoginSurface() {
@@ -2468,6 +2488,14 @@
     const hash = String(window.location.hash || '').toLowerCase();
     const combined = `${pathname} ${search} ${hash}`;
     const normalizedPath = pathname.replace(/\/+$/, '') || '/';
+
+    if (isCurrentAtActiveLoginEntry()) {
+      targetLog('命中任务级登录入口覆盖，当前路径按登录页处理', {
+        currentUrl: window.location.href,
+        activeLoginEntry: activeLoginEntryOverride.normalizedUrl
+      });
+      return false;
+    }
 
     const loginKeywords = /login|signin|sign-in|auth|oauth|cas|passport|账户登录|扫码登录/;
     if (loginKeywords.test(combined)) return false;
@@ -2528,6 +2556,59 @@
     }
 
     return hasMenuLikeUi && !hasPasswordField;
+  }
+
+  function normalizeLoginEntryUrl(urlLike) {
+    try {
+      const parsed = new URL(String(urlLike || '').trim(), window.location.href);
+      const protocol = String(parsed.protocol || '').toLowerCase();
+      if (protocol !== 'http:' && protocol !== 'https:') return '';
+      const pathname = String(parsed.pathname || '/').replace(/\/+$/, '') || '/';
+      return `${parsed.origin}${pathname}`;
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function setActiveLoginEntryOverride(urlLike, ttlMs = 10 * 60 * 1000) {
+    const normalized = normalizeLoginEntryUrl(urlLike);
+    if (!normalized) {
+      activeLoginEntryOverride = { normalizedUrl: '', expiresAt: 0 };
+      return;
+    }
+
+    activeLoginEntryOverride = {
+      normalizedUrl: normalized,
+      expiresAt: Date.now() + Math.max(1000, Number(ttlMs) || 0)
+    };
+  }
+
+  function clearActiveLoginEntryOverride() {
+    activeLoginEntryOverride = {
+      normalizedUrl: '',
+      expiresAt: 0
+    };
+  }
+
+  function isCurrentAtActiveLoginEntry() {
+    if (!activeLoginEntryOverride.normalizedUrl) return false;
+    if (Date.now() > Number(activeLoginEntryOverride.expiresAt || 0)) {
+      clearActiveLoginEntryOverride();
+      return false;
+    }
+
+    const currentNormalized = normalizeLoginEntryUrl(window.location.href);
+    if (!currentNormalized) return false;
+    return currentNormalized === activeLoginEntryOverride.normalizedUrl;
+  }
+
+  function isCurrentOnRealLoginEntry(realTargetUrl) {
+    const currentNormalized = normalizeLoginEntryUrl(window.location.href);
+    const realNormalized = normalizeLoginEntryUrl(realTargetUrl);
+    if (!currentNormalized || !realNormalized) {
+      return false;
+    }
+    return currentNormalized === realNormalized;
   }
 
   async function shouldSkipAutofillAsAlreadyLoggedIn(options = {}) {
@@ -2888,6 +2969,13 @@
     });
 
     await waitForLoginSurface(1000, 120);
+
+    if (!hasLikelyLoginSurface()) {
+      targetLog('安全门禁：当前页面未检测到登录界面特征，终止代填以避免误填', {
+        href: window.location.href
+      });
+      return false;
+    }
     
     const strategy = detectStrategy();
     targetLog('检测到代填策略', { strategy });
@@ -3082,7 +3170,35 @@
 
         applyForceRefreshRules(auth.extra || {});
 
-        const skipAutofill = await shouldSkipAutofillAsAlreadyLoggedIn({ hasTask: Boolean(taskId) });
+        const realTargetUrl = String(auth.realTargetUrl || '').trim();
+        setActiveLoginEntryOverride(realTargetUrl, 10 * 60 * 1000);
+        const onRealLoginEntry = realTargetUrl ? isCurrentOnRealLoginEntry(realTargetUrl) : false;
+        const onPresetNonStandardLoginPath = shouldForceRefreshCurrentPath();
+
+        targetLog('realTargetUrl 登录页判定结果', {
+          realTargetUrl,
+          onRealLoginEntry,
+          onPresetNonStandardLoginPath,
+          currentUrl: window.location.href
+        });
+
+        if (realTargetUrl && !onRealLoginEntry && !onPresetNonStandardLoginPath) {
+          targetLog('当前页面非真实登录页，按已登录状态处理并禁止代填', {
+            href: window.location.href,
+            realTargetUrl,
+            username: auth.username
+          });
+          showSubmitNotice('✓ 检测到已登录页面，已禁止代填');
+          await startSessionAfterLogin(taskId, auth.username, 'already_logged_in_by_real_target');
+          if (!isTopIamPlatformPage()) {
+            ensureUserWatermark(auth.fullName || auth.username);
+          }
+          return;
+        }
+
+        const skipAutofill = realTargetUrl
+          ? false
+          : await shouldSkipAutofillAsAlreadyLoggedIn({ hasTask: Boolean(taskId) });
         if (skipAutofill) {
           targetLog('检测到应用已处于登录态，跳过自动代填', {
             href: window.location.href,
@@ -3098,7 +3214,7 @@
           return;
         }
 
-        if (shouldForceRefreshCurrentPath()) {
+        if (onPresetNonStandardLoginPath) {
           const resetTriggeredByRule = await forceResetAppStateAndRetry(taskId, 'force_refresh_path_rule');
           if (resetTriggeredByRule) {
             return;
@@ -3159,6 +3275,7 @@
       }
     } finally {
       // 重置执行标记，允许后续继续执行（如果需要）
+      clearActiveLoginEntryOverride();
       performIntelligentFillExecuting = false;
       targetLog('performIntelligentFill执行标记已重置');
     }

@@ -11,6 +11,7 @@
   const DEBUG_EVENT = '__TOPIAM_DEBUG_EVENT__';
   const DEBUG_PANEL_STORAGE_KEY = 'debugPanelEnabled';
   const TOPIAM_DOMAINS_STORAGE_KEY = 'topiamDomains';
+  const DISCOVERED_APPS_STORAGE_KEY = 'discoveredApps';
 
   const debugState = {
     enabled: false,
@@ -38,6 +39,9 @@
   let appListBridgeSeen = false;
   let appListFallbackScheduled = false;
   const APP_LIST_FALLBACK_DELAY_MS = 12000;
+  let launchCacheHydrating = false;
+  let launchCacheHydratedAt = 0;
+  const LAUNCH_CACHE_HYDRATE_COOLDOWN_MS = 10000;
 
   // 心跳探测状态：最多 2 次，之后进入纯 Cookie 监测模式
   let topiamHeartbeatAttempts = 0;
@@ -691,10 +695,49 @@
       return;
     }
 
+    hydrateLaunchCacheFromStorage(`portal_ready_${source}`);
     applyDebugPanelPreference(source);
     monitorTopIamLogout();
     monitorAppClicks();
     monitorAppDiscovery();
+  }
+
+  function hydrateLaunchCacheFromStorage(source = 'unknown', force = false) {
+    if (launchCacheHydrating) return;
+    if (!force && Date.now() - launchCacheHydratedAt < LAUNCH_CACHE_HYDRATE_COOLDOWN_MS) {
+      return;
+    }
+
+    launchCacheHydrating = true;
+    chrome.storage.local.get([DISCOVERED_APPS_STORAGE_KEY], (result) => {
+      try {
+        const apps = Array.isArray(result?.[DISCOVERED_APPS_STORAGE_KEY])
+          ? result[DISCOVERED_APPS_STORAGE_KEY]
+          : [];
+
+        const launchItems = apps
+          .map((item) => ({
+            appId: String(item?.appId || item?.id || '').trim(),
+            appName: String(item?.name || item?.appName || '').trim(),
+            initLoginUrl: String(item?.initLoginUrl || item?.init_login_url || '').trim(),
+            protocol: String(item?.protocol || 'form').trim().toLowerCase()
+          }))
+          .filter((item) => item.initLoginUrl && item.protocol === 'form');
+
+        if (launchItems.length > 0) {
+          cacheAppLaunchItems(launchItems);
+          monitorLog('已从本地缓存预热应用启动URL', {
+            source,
+            count: launchItems.length,
+            cacheSize: appLaunchCache.size
+          });
+        }
+
+        launchCacheHydratedAt = Date.now();
+      } finally {
+        launchCacheHydrating = false;
+      }
+    });
   }
 
   function watchPortalPathChanges() {
@@ -1266,6 +1309,7 @@
           formApps.forEach((app) => registerDiscoveredApp(app));
         }
       });
+
     }
 
     monitorLog('处理应用列表完成', {
@@ -1758,8 +1802,10 @@
       const sameTopLevelHost = targetHost === currentHost
         || targetHost.endsWith(`.${currentHost}`)
         || currentHost.endsWith(`.${targetHost}`);
+      const targetInConfiguredTopIamDomains = isKnownTopIamDomain(targetHost);
+      const targetLooksLikeTopIam = /topiam/.test(targetHost);
 
-      return sameOrigin || sameTopLevelHost;
+      return sameOrigin || sameTopLevelHost || targetInConfiguredTopIamDomains || targetLooksLikeTopIam;
     } catch (error) {
       return false;
     }
@@ -2126,6 +2172,15 @@
   }
 
   function bootstrapEarly() {
+    if (isPortalAppPage()) {
+      hydrateLaunchCacheFromStorage('bootstrap_portal', true);
+    }
+
+    if (isPortalAppPage()) {
+      // 首次进入应用页时先绑定点击拦截，避免探测完成前漏拦截首击。
+      monitorAppClicks();
+    }
+
     if (shouldAttemptTopIamProbe('early_bridge_bootstrap') || isPortalAppPage()) {
       installApiBridge();
       bindApiEvent();

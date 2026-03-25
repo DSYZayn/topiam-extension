@@ -1372,7 +1372,7 @@ function extractCredentialsFromFormData(formData) {
 
 async function prefetchInitLoginAndDispatch(originalTabId, initLoginUrl, appMeta, options = {}) {
   const ghostTab = await guardedTabsCreate({
-    url: initLoginUrl,
+    url: 'about:blank',
     active: false
   }, 'prefetch_ghost_tab');
 
@@ -1381,22 +1381,35 @@ async function prefetchInitLoginAndDispatch(originalTabId, initLoginUrl, appMeta
     throw new Error('创建预取标签失败');
   }
 
+  const cacheOnly = Boolean(options.cacheOnly);
+
   PREFETCH_GHOST_TABS.set(ghostTabId, {
     originalTabId,
     appId: appMeta?.appId || '',
     appName: appMeta?.appName || '',
+    cacheOnly,
     openInNewTab: Boolean(options.openInNewTab),
     startedAt: Date.now()
   });
   const keepGhostAsDestination = Boolean(options.openInNewTab);
 
-  bgLog('开始预访问 initLoginUrl', { originalTabId, ghostTabId, initLoginUrl });
+  bgLog('开始预访问 initLoginUrl', { originalTabId, ghostTabId, initLoginUrl, cacheOnly });
   sendMonitorDebug(originalTabId, '预取开始', {
     ghostTabId,
     initLoginUrl,
     appId: appMeta?.appId || '',
     appName: appMeta?.appName || ''
   });
+
+  try {
+    await chrome.tabs.update(ghostTabId, {
+      url: initLoginUrl,
+      active: false
+    });
+  } catch (error) {
+    PREFETCH_GHOST_TABS.delete(ghostTabId);
+    throw error;
+  }
 
   return new Promise((resolve, reject) => {
     let done = false;
@@ -1453,6 +1466,28 @@ async function prefetchInitLoginAndDispatch(originalTabId, initLoginUrl, appMeta
       };
 
       try {
+        if (cacheOnly) {
+          await putEncryptedCredentialCache({
+            appId: appMeta?.appId || '',
+            appName: appMeta?.appName || '',
+            sourceUrl: initLoginUrl,
+            targetUrl
+          }, {
+            ...dispatchPayload,
+            realTargetUrl: targetUrl
+          });
+
+          sendMonitorDebug(originalTabId, '预取缓存预热成功（未派发）', {
+            reason,
+            targetUrl,
+            appId: appMeta?.appId || '',
+            appName: appMeta?.appName || ''
+          });
+
+          await finish();
+          return true;
+        }
+
         sendMonitorDebug(originalTabId, '触发预取兜底派发', {
           reason,
           targetUrl,
@@ -1516,6 +1551,17 @@ async function prefetchInitLoginAndDispatch(originalTabId, initLoginUrl, appMeta
           destinationTabId: keepGhostAsDestination ? ghostTabId : undefined
         };
 
+        if (cacheOnly) {
+          sendMonitorDebug(originalTabId, '缓存预热命中现有缓存（未派发）', {
+            reason,
+            targetUrl,
+            appId: appMeta?.appId || '',
+            appName: appMeta?.appName || ''
+          });
+          await finish();
+          return true;
+        }
+
         sendMonitorDebug(originalTabId, '触发预取缓存兜底派发', {
           reason,
           targetUrl,
@@ -1547,6 +1593,22 @@ async function prefetchInitLoginAndDispatch(originalTabId, initLoginUrl, appMeta
     PREFETCH_SESSIONS.set(ghostTabId, {
       resolve: async (payload) => {
         if (done) return;
+
+        if (cacheOnly) {
+          const cacheTargetUrl = String(payload?.targetUrl || state.extractedTargetUrl || '').trim();
+          if (cacheTargetUrl && payload?.username && payload?.password) {
+            await putEncryptedCredentialCache({
+              appId: appMeta?.appId || '',
+              appName: appMeta?.appName || '',
+              sourceUrl: payload?.sourceUrl || initLoginUrl,
+              targetUrl: cacheTargetUrl
+            }, {
+              ...payload,
+              realTargetUrl: cacheTargetUrl
+            });
+          }
+        }
+
         done = true;
         chrome.tabs.onUpdated.removeListener(onUpdated);
         clearTimeout(timeoutId);
@@ -1559,7 +1621,7 @@ async function prefetchInitLoginAndDispatch(originalTabId, initLoginUrl, appMeta
           } catch (error) {}
         }
 
-        sendMonitorDebug(originalTabId, '预取成功（POST提取）', {
+        sendMonitorDebug(originalTabId, cacheOnly ? '预取缓存预热成功（POST提取）' : '预取成功（POST提取）', {
           targetUrl: payload?.targetUrl || '',
           username: payload?.username || '',
           hasPassword: Boolean(payload?.password)
@@ -1774,6 +1836,7 @@ async function extractAndRedirect(formFillUrl, originalTabId) {
       username: extracted.username,
       password: extracted.password,
       extra: extracted.extraParams || {},
+      realTargetUrl: normalizedTargetUrl,
       originalTab: originalTabId,
       targetOrigin: target.origin
     });
@@ -1879,6 +1942,7 @@ async function dispatchTaskToTarget(originalTabId, payload) {
     username: payload.username,
     password: payload.password,
     extra: payload.extra || {},
+    realTargetUrl: realTargetUrl || payload.realTargetUrl || '',
     originalTab: destinationTabId,
     targetOrigin: target.origin
   });
@@ -2157,6 +2221,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       username: data.username,
       password: data.password,
       extra: data.extra,
+      realTargetUrl: data.realTargetUrl || '',
       fullName: identity?.fullName || data.username
     });
     return true;
@@ -2640,6 +2705,33 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (mapped && typeof senderTabId === 'number') {
       const session = PREFETCH_SESSIONS.get(senderTabId);
 
+      if (mapped.cacheOnly) {
+        if (enrichedPayload.targetUrl && enrichedPayload.username && enrichedPayload.password) {
+          putEncryptedCredentialCache({
+            appId: enrichedPayload.appId || mapped?.appId || '',
+            appName: enrichedPayload.appName || mapped?.appName || '',
+            sourceUrl: enrichedPayload.sourceUrl || sender?.url || '',
+            targetUrl: enrichedPayload.targetUrl
+          }, {
+            ...enrichedPayload,
+            submitMethod: 'post',
+            realTargetUrl: enrichedPayload.targetUrl
+          }).catch(() => {});
+        }
+
+        if (session?.resolve) {
+          session.resolve({
+            ...enrichedPayload,
+            submitMethod: 'post'
+          });
+        } else {
+          PREFETCH_GHOST_TABS.delete(senderTabId);
+        }
+
+        sendResponse({ ok: true, cacheOnly: true });
+        return true;
+      }
+
       if (!enrichedPayload.targetUrl || !enrichedPayload.username || !enrichedPayload.password) {
         getEncryptedCredentialCache({
           appId: enrichedPayload.appId || mapped?.appId || '',
@@ -2824,6 +2916,30 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           error: explicitNoDefaultAccount ? '至少需要配置一个默认账户' : '预访问信息不足，未自动跳转应用'
         });
       });
+    return true;
+  }
+
+  if (request.action === 'prefetchCredentialCacheOnly') {
+    const tabId = sender?.tab?.id;
+    const initLoginUrl = String(request.initLoginUrl || '').trim();
+    const appMeta = request.app || {};
+
+    if (typeof tabId !== 'number') {
+      sendResponse({ ok: false, error: '无有效标签页' });
+      return true;
+    }
+
+    if (!initLoginUrl) {
+      sendResponse({ ok: false, error: 'initLoginUrl 为空' });
+      return true;
+    }
+
+    prefetchInitLoginAndDispatch(tabId, initLoginUrl, appMeta, {
+      openInNewTab: false,
+      cacheOnly: true
+    })
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || 'cache_prefetch_failed' }));
     return true;
   }
 });
